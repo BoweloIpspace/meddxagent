@@ -145,7 +145,7 @@ class RareBench(Bench):
     def _make_subsets_patient_entries(self):
         """..."""
         for subset in self.dataset_subset:
-            dataset_subset = load_dataset(self.DATASET_FILE, subset, split="test", revision="4bb064a52a253cfaa5ee228926e86af3ec0e5731")
+            dataset_subset = load_dataset(self.DATASET_FILE, subset, split="test", trust_remote_code=True, revision="4bb064a52a253cfaa5ee228926e86af3ec0e5731")
             patient_entries = self._load_ehr_phenotype_data(dataset_subset)
             for i, patient_entry in enumerate(patient_entries):
                 patient_entry["id"] = f"{subset}_{i}"
