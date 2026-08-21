@@ -44,11 +44,14 @@ dev = [
     "pytest",
 ]
 
+[project.scripts]
+meddx-clinical-api = "ddxdriver.clinical.api:main"
 
-[tool.setuptools]
-packages = [
-    "ddxdriver",
-]
+[tool.setuptools.packages.find]
+include = ["ddxdriver*"]
+
+[tool.setuptools.package-data]
+"ddxdriver.clinical" = ["clinical.yml"]
 
 [tool.black]
 line-length = 100
