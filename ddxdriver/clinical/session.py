@@ -156,6 +156,7 @@ class ClinicalSession:
             "patient_profile": self.patient.patient_profile or "",
             "history_complete": self.history_complete,
             "pending_question": self.history.pending_question if self.history else None,
+            "history_turns": self.history.turns if self.history else [],
             "dialogue_history": self.history.dialogue_history if self.history else "",
             "result": self.result.to_dict() if self.result else None,
         }
