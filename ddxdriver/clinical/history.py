@@ -84,22 +84,33 @@ class ClinicalHistorySession:
         self.history_taking_agent.record_patient_answer(answer)
 
     def finish(self) -> str:
-        """Build the patient profile consumed by retrieval/diagnosis and return it."""
+        """Build the patient profile consumed by retrieval/diagnosis and return it.
+
+        The research profile summarizer is optimized for antecedents/symptoms. In
+        clinical mode the initial payload can also contain examination and test
+        results, so it is retained verbatim alongside the history-derived profile.
+        """
         if self.pending_question is not None:
             raise RuntimeError("Cannot finish history while a question is waiting for a patient response")
 
+        derived_profile = ""
         if self.dialogue_history:
-            profile = dialogue_to_patient_profile(
+            derived_profile = dialogue_to_patient_profile(
                 dialogue_history_text=self.dialogue_history,
                 patient=self.patient,
                 model=self.profile_model,
             )
-        else:
-            profile = self.patient.patient_initial_info
+            if not isinstance(derived_profile, str):
+                raise TypeError("MEDDxAgent history-derived patient profile must be a string")
 
-        if not isinstance(profile, str):
-            raise TypeError("MEDDxAgent patient profile must be a string")
+        profile_parts = [
+            "Clinical information available before history:\n"
+            + self.patient.patient_initial_info.strip()
+        ]
+        if derived_profile.strip():
+            profile_parts.append("History-derived patient profile:\n" + derived_profile.strip())
 
+        profile = "\n\n".join(profile_parts)
         self.patient.patient_profile = profile
         self.complete = True
         return profile
