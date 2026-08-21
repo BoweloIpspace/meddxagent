@@ -1,3 +1,7 @@
+from pathlib import Path
+
+from Bio import Entrez
+
 from ddxdriver.clinical import (
     ClinicalContext,
     ClinicalHistorySession,
@@ -5,7 +9,9 @@ from ddxdriver.clinical import (
     collect_clinical_result,
     load_clinical_config,
 )
+from ddxdriver.clinical.config import DEFAULT_CLINICAL_CONFIG
 from ddxdriver.history_taking_agents.llm_history_taking import LLMHistoryTaking
+from ddxdriver.rag_agents._searchrag_utils import _configure_entrez
 from ddxdriver.utils import DialogueHistory, OutputDict, Patient
 
 
@@ -123,6 +129,24 @@ def test_clinical_config_is_pubmed_and_has_no_benchmark_patient_agent():
     assert config["rag"]["config"]["corpus_name"] == "PubMed"
     assert config["diagnosis"]["config"]["fewshot"]["type"] == "none"
     assert "patient" not in config
+
+
+def test_default_clinical_config_is_packaged_and_matches_repo_mirror():
+    repo_config = Path(__file__).resolve().parents[1] / "configs" / "clinical.yml"
+    assert DEFAULT_CLINICAL_CONFIG.exists()
+    assert repo_config.exists()
+    assert DEFAULT_CLINICAL_CONFIG.read_text(encoding="utf-8") == repo_config.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_pubmed_entrez_uses_environment_identity(monkeypatch):
+    monkeypatch.setenv("NCBI_EMAIL", "clinical@example.com")
+    monkeypatch.setenv("NCBI_API_KEY", "test-ncbi-key")
+
+    assert _configure_entrez() == "clinical@example.com"
+    assert Entrez.email == "clinical@example.com"
+    assert Entrez.api_key == "test-ncbi-key"
 
 
 def test_clinical_driver_config_removes_simulated_history_agent():

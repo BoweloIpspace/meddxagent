@@ -1,3 +1,4 @@
+import os
 from Bio import Entrez
 import requests
 from bs4 import BeautifulSoup
@@ -8,6 +9,7 @@ from ddxdriver.utils import strip_all_lines
 from ddxdriver.logger import log
 
 ADDED_EXTRA = 10
+
 
 class Corpus(Enum):
     PUBMED = "PubMed"
@@ -33,11 +35,19 @@ def format_search_result(result):
         return f"Title: {result['title']}\nContent:\n{result['content']}"
 
 
+def _configure_entrez(email: str | None = None) -> str:
+    """Configure Biopython Entrez identity from explicit input or environment."""
+    resolved_email = email or os.getenv("NCBI_EMAIL") or "your.email@example.com"
+    Entrez.email = resolved_email
+    Entrez.api_key = os.getenv("NCBI_API_KEY")
+    return resolved_email
+
+
 def _search_pubmed(
     query: str,
     top_k: int = 5,
     min_abstract_length: int = 100,
-    email: str = "your.email@example.com",
+    email: str | None = None,
 ) -> List[Dict[str, str]]:
     """
     Search PubMed for a query and return the titles and formatted abstracts of the top k results.
@@ -47,12 +57,12 @@ def _search_pubmed(
     - query (str): The search query.
     - top_k (int): The number of top results to return.
     - min_abstract_length (int): The minimum length of the abstract to accept.
-    - email (str): Email address to use for Entrez.
+    - email (str): Optional Entrez email. Falls back to NCBI_EMAIL, then the legacy placeholder.
 
     Returns:
-    - list of dict: A list of dictionaries with 'title' and 'abstract' for each result.
+    - list of dict: a list of dictionaries with 'title' and 'content' for each result.
     """
-    Entrez.email = email
+    _configure_entrez(email=email)
 
     # Modify query to include only free full-text articles
     query = f"{query} AND free full text[sb]"
@@ -119,7 +129,7 @@ def _search_wikipedia(
     - min_summary_length (int): The minimum length of the summary to accept.
 
     Returns:
-    - list of dict: A list of dictionaries with 'title' and 'summary' for each result.
+    - list of dict: a list of dictionaries with 'title' and 'content' for each result.
     """
     url = "https://en.wikipedia.org/w/api.php"
     max_query_length = 300  # Wikipedia's max length

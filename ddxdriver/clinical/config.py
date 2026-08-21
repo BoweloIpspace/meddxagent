@@ -6,7 +6,7 @@ from .context import ClinicalContext
 from .session import ClinicalSession
 
 
-DEFAULT_CLINICAL_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "clinical.yml"
+DEFAULT_CLINICAL_CONFIG = Path(__file__).with_name("clinical.yml")
 
 
 def load_clinical_config(path: str | Path | None = None) -> dict:

@@ -1,4 +1,5 @@
 import json
+import os
 from unittest.mock import patch
 
 from tornado.testing import AsyncHTTPTestCase
@@ -78,21 +79,137 @@ class TestClinicalApi(AsyncHTTPTestCase):
     def get_app(self):
         return make_app()
 
+    def _create_fake_session(self) -> str:
+        def fake_create(patient_initial_info, patient_id, config):
+            return FakeClinicalSession(patient_initial_info, patient_id)
+
+        with (
+            patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True),
+            patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create),
+        ):
+            response = self.fetch(
+                "/api/v1/clinical/sessions",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"patient_initial_info": "Chief complaint: Headache"}),
+            )
+        assert response.code == 201
+        return json.loads(response.body)["session_id"]
+
     def test_health(self):
         response = self.fetch("/api/v1/health")
         assert response.code == 200
         assert json.loads(response.body) == {"status": "ok"}
+
+    def test_production_origin_cors_and_preflight(self):
+        origin = "https://meddxagentfrontend.vercel.app"
+        response = self.fetch("/api/v1/health", headers={"Origin": origin})
+        assert response.code == 200
+        assert response.headers.get("Access-Control-Allow-Origin") == origin
+        assert response.headers.get("Vary") == "Origin"
+
+        preflight = self.fetch(
+            "/api/v1/clinical/sessions",
+            method="OPTIONS",
+            headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
+        )
+        assert preflight.code == 204
+        assert preflight.headers.get("Access-Control-Allow-Origin") == origin
+        assert "POST" in preflight.headers.get("Access-Control-Allow-Methods", "")
+
+    def test_readiness_reports_missing_model_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.fetch("/api/v1/ready")
+        assert response.code == 503
+        assert json.loads(response.body) == {
+            "status": "not_ready",
+            "missing_environment": ["OAI_KEY"],
+        }
+
+    def test_readiness_is_ready_when_model_environment_is_present(self):
+        with patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True):
+            response = self.fetch("/api/v1/ready")
+        assert response.code == 200
+        assert json.loads(response.body) == {"status": "ready"}
+
+    def test_session_creation_is_503_when_runtime_is_not_ready(self):
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.fetch(
+                "/api/v1/clinical/sessions",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"patient_initial_info": "Chief complaint: Headache"}),
+            )
+        assert response.code == 503
+        assert json.loads(response.body) == {
+            "error": "MEDDxAgent backend is not ready",
+            "missing_environment": ["OAI_KEY"],
+        }
 
     def test_missing_session_is_404(self):
         response = self.fetch("/api/v1/clinical/sessions/does-not-exist")
         assert response.code == 404
         assert json.loads(response.body) == {"error": "Clinical session not found"}
 
+    def test_invalid_session_transitions_are_400(self):
+        session_id = self._create_fake_session()
+
+        answer = self.fetch(
+            f"/api/v1/clinical/sessions/{session_id}/answer",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"answer": "Yes"}),
+        )
+        assert answer.code == 400
+        assert json.loads(answer.body) == {
+            "error": "No MEDDxAgent question is waiting for a patient response"
+        }
+
+        run = self.fetch(
+            f"/api/v1/clinical/sessions/{session_id}/run",
+            method="POST",
+            body="",
+        )
+        assert run.code == 400
+        assert json.loads(run.body) == {
+            "error": "Finish the human-in-the-loop history before running retrieval/diagnosis"
+        }
+
+        question = self.fetch(
+            f"/api/v1/clinical/sessions/{session_id}/question",
+            method="POST",
+            body="",
+        )
+        assert question.code == 200
+
+        second_question = self.fetch(
+            f"/api/v1/clinical/sessions/{session_id}/question",
+            method="POST",
+            body="",
+        )
+        assert second_question.code == 400
+        assert json.loads(second_question.body) == {
+            "error": "Submit the pending patient response before requesting another question"
+        }
+
+        finish = self.fetch(
+            f"/api/v1/clinical/sessions/{session_id}/history/finish",
+            method="POST",
+            body="",
+        )
+        assert finish.code == 400
+        assert json.loads(finish.body) == {
+            "error": "Cannot finish history while a question is waiting for a patient response"
+        }
+
     def test_full_session_contract_preserves_late_clinical_context(self):
         def fake_create(patient_initial_info, patient_id, config):
             return FakeClinicalSession(patient_initial_info, patient_id)
 
-        with patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create):
+        with (
+            patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True),
+            patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create),
+        ):
             create_response = self.fetch(
                 "/api/v1/clinical/sessions",
                 method="POST",

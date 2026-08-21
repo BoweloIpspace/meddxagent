@@ -1,0 +1,52 @@
+# Application-only MEDDxAgent configuration.
+# Research/benchmark configs remain unchanged.
+# Human-in-the-loop history consumes one phase of the original six-turn budget;
+# the post-history DDxDriver run therefore uses five RAG/diagnosis turns.
+
+context:
+  specialist_preface: "You are a medical doctor."
+  diagnosis_options: []
+  ddx_length: null
+
+ddxdriver:
+  class_name: "ddxdriver.ddxdrivers.open_choice.OpenChoice"
+  config:
+    agent_prompt_length: 10
+    available_agents: ["history_taking", "rag", "diagnosis"]
+    max_turns: 5
+    model:
+      class_name: "ddxdriver.models.oai_chat.OpenAIChat"
+      config:
+        model_name: "gpt-4o"
+
+history_taking:
+  class_name: "ddxdriver.history_taking_agents.llm_history_taking.LLMHistoryTaking"
+  config:
+    max_questions: 5
+    model:
+      class_name: "ddxdriver.models.oai_chat.OpenAIChat"
+      config:
+        model_name: "gpt-4o"
+
+diagnosis:
+  class_name: "ddxdriver.diagnosis_agents.single_llm_cot.SingleLLMCOT"
+  config:
+    model:
+      class_name: "ddxdriver.models.oai_chat.OpenAIChat"
+      config:
+        model_name: "gpt-4o"
+    fewshot:
+      type: "none"
+      num_shots: 0
+      self_generated_fewshot_cot: false
+
+rag:
+  class_name: "ddxdriver.rag_agents.searchrag_standard.SearchRAGStandard"
+  config:
+    corpus_name: "PubMed"
+    top_k_search: 2
+    max_keyword_searches: 3
+    model:
+      class_name: "ddxdriver.models.oai_chat.OpenAIChat"
+      config:
+        model_name: "gpt-4o"

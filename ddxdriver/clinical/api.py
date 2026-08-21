@@ -11,6 +11,24 @@ import tornado.web
 from .config import create_clinical_session, load_clinical_config
 
 
+def missing_runtime_environment(config: dict) -> list[str]:
+    """Return environment variables required by model classes in the active config."""
+    model_classes: set[str] = set()
+    for section in ("ddxdriver", "history_taking", "diagnosis", "rag"):
+        model_cfg = config.get(section, {}).get("config", {}).get("model", {})
+        class_name = model_cfg.get("class_name")
+        if isinstance(class_name, str):
+            model_classes.add(class_name)
+
+    required: set[str] = set()
+    if any(name.endswith(".OpenAIChat") for name in model_classes):
+        required.add("OAI_KEY")
+    if any(name.endswith(".OpenAIAzureChat") for name in model_classes):
+        required.update({"OAI_KEY", "AZURE_ENDPOINT"})
+
+    return sorted(name for name in required if not os.getenv(name))
+
+
 class ClinicalSessionStore:
     """Process-local session storage for the first frontend integration.
 
@@ -114,8 +132,29 @@ class HealthHandler(BaseHandler):
         self.finish({"status": "ok"})
 
 
+class ReadinessHandler(BaseHandler):
+    async def get(self):
+        missing = missing_runtime_environment(self.store.config)
+        if missing:
+            self.set_status(503)
+            self.finish({"status": "not_ready", "missing_environment": missing})
+            return
+        self.finish({"status": "ready"})
+
+
 class SessionsHandler(BaseHandler):
     async def post(self):
+        missing = missing_runtime_environment(self.store.config)
+        if missing:
+            self.set_status(503)
+            self.finish(
+                {
+                    "error": "MEDDxAgent backend is not ready",
+                    "missing_environment": missing,
+                }
+            )
+            return
+
         try:
             payload = self.json_body()
             patient_initial_info = payload.get("patient_initial_info", "")
@@ -221,6 +260,7 @@ def make_app(config_path: str | Path | None = None) -> tornado.web.Application:
     store = ClinicalSessionStore(config)
     routes = [
         (r"/api/v1/health", HealthHandler, {"store": store}),
+        (r"/api/v1/ready", ReadinessHandler, {"store": store}),
         (r"/api/v1/clinical/sessions", SessionsHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)", SessionHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/context", ContextHandler, {"store": store}),
