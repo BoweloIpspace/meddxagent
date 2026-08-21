@@ -83,7 +83,10 @@ class TestClinicalApi(AsyncHTTPTestCase):
         def fake_create(patient_initial_info, patient_id, config):
             return FakeClinicalSession(patient_initial_info, patient_id)
 
-        with patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create):
+        with (
+            patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True),
+            patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create),
+        ):
             response = self.fetch(
                 "/api/v1/clinical/sessions",
                 method="POST",
@@ -128,6 +131,20 @@ class TestClinicalApi(AsyncHTTPTestCase):
             response = self.fetch("/api/v1/ready")
         assert response.code == 200
         assert json.loads(response.body) == {"status": "ready"}
+
+    def test_session_creation_is_503_when_runtime_is_not_ready(self):
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.fetch(
+                "/api/v1/clinical/sessions",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"patient_initial_info": "Chief complaint: Headache"}),
+            )
+        assert response.code == 503
+        assert json.loads(response.body) == {
+            "error": "MEDDxAgent backend is not ready",
+            "missing_environment": ["OAI_KEY"],
+        }
 
     def test_missing_session_is_404(self):
         response = self.fetch("/api/v1/clinical/sessions/does-not-exist")
@@ -189,7 +206,10 @@ class TestClinicalApi(AsyncHTTPTestCase):
         def fake_create(patient_initial_info, patient_id, config):
             return FakeClinicalSession(patient_initial_info, patient_id)
 
-        with patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create):
+        with (
+            patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True),
+            patch("ddxdriver.clinical.api.create_clinical_session", side_effect=fake_create),
+        ):
             create_response = self.fetch(
                 "/api/v1/clinical/sessions",
                 method="POST",
