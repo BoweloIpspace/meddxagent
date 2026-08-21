@@ -1,5 +1,7 @@
 # Application-only MEDDxAgent configuration.
 # Research/benchmark configs remain unchanged.
+# Human-in-the-loop history consumes one phase of the original six-turn budget;
+# the post-history DDxDriver run therefore uses five RAG/diagnosis turns.
 
 context:
   specialist_preface: "You are a medical doctor."
@@ -11,7 +13,7 @@ ddxdriver:
   config:
     agent_prompt_length: 10
     available_agents: ["history_taking", "rag", "diagnosis"]
-    max_turns: 6
+    max_turns: 5
     model:
       class_name: "ddxdriver.models.oai_chat.OpenAIChat"
       config:
