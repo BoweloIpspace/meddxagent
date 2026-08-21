@@ -144,6 +144,17 @@ class ReadinessHandler(BaseHandler):
 
 class SessionsHandler(BaseHandler):
     async def post(self):
+        missing = missing_runtime_environment(self.store.config)
+        if missing:
+            self.set_status(503)
+            self.finish(
+                {
+                    "error": "MEDDxAgent backend is not ready",
+                    "missing_environment": missing,
+                }
+            )
+            return
+
         try:
             payload = self.json_body()
             patient_initial_info = payload.get("patient_initial_info", "")
