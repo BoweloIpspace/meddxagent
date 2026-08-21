@@ -77,6 +77,20 @@ class ClinicalSession:
     def history_complete(self) -> bool:
         return self.history is None or self.history.complete
 
+    def update_patient_initial_info(self, patient_initial_info: str) -> None:
+        """Refresh the clinical payload as later exam/test findings become available."""
+        if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
+            raise ValueError("patient_initial_info must be a non-empty string")
+
+        self.patient.patient_initial_info = patient_initial_info.strip()
+        self.driver = None
+        self.result = None
+
+        if self.history is None:
+            self.patient.patient_profile = self.patient.patient_initial_info
+        elif self.patient.patient_profile:
+            self.history.refresh_initial_context()
+
     def next_question(self) -> str | None:
         if self.history is None:
             return None
