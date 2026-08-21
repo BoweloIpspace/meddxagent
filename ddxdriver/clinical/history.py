@@ -46,6 +46,16 @@ class ClinicalHistorySession:
         return self.history_taking_agent.dialogue_history.format_dialogue_history()
 
     @property
+    def turns(self) -> list[dict[str, str]]:
+        turns: list[dict[str, str]] = []
+        for role, content in self.history_taking_agent.dialogue_history.dialogue_history:
+            if role == "doctor":
+                turns.append({"question": content, "answer": ""})
+            elif role == "patient" and turns:
+                turns[-1]["answer"] = content
+        return turns
+
+    @property
     def pending_question(self) -> str | None:
         dialogue = self.history_taking_agent.dialogue_history.dialogue_history
         if not dialogue:
