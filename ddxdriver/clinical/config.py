@@ -2,13 +2,11 @@ from pathlib import Path
 
 import yaml
 
-from ddxdriver.utils import find_project_root
-
 from .context import ClinicalContext
 from .session import ClinicalSession
 
 
-DEFAULT_CLINICAL_CONFIG = find_project_root() / "configs" / "clinical.yml"
+DEFAULT_CLINICAL_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "clinical.yml"
 
 
 def load_clinical_config(path: str | Path | None = None) -> dict:
