@@ -142,6 +142,26 @@ class SessionHandler(BaseHandler):
             self.finish({"session_id": session_id, **result})
 
 
+class ContextHandler(BaseHandler):
+    async def post(self, session_id: str):
+        try:
+            payload = self.json_body()
+            patient_initial_info = payload.get("patient_initial_info", "")
+            if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
+                raise ValueError("patient_initial_info is required")
+        except (ValueError, TypeError) as exc:
+            self.write_api_error(400, str(exc))
+            return
+
+        def update_context(session):
+            session.update_patient_initial_info(patient_initial_info)
+            return session.snapshot()
+
+        result = await self.run_session_action(session_id, update_context)
+        if result is not None:
+            self.finish({"session_id": session_id, **result})
+
+
 class NextQuestionHandler(BaseHandler):
     async def post(self, session_id: str):
         def generate(session):
@@ -203,6 +223,7 @@ def make_app(config_path: str | Path | None = None) -> tornado.web.Application:
         (r"/api/v1/health", HealthHandler, {"store": store}),
         (r"/api/v1/clinical/sessions", SessionsHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)", SessionHandler, {"store": store}),
+        (r"/api/v1/clinical/sessions/([^/]+)/context", ContextHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/question", NextQuestionHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/answer", AnswerHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/history/finish", FinishHistoryHandler, {"store": store}),
