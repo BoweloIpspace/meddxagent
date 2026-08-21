@@ -1,4 +1,10 @@
-from ddxdriver.clinical import ClinicalContext, ClinicalHistorySession, collect_clinical_result
+from ddxdriver.clinical import (
+    ClinicalContext,
+    ClinicalHistorySession,
+    ClinicalSession,
+    collect_clinical_result,
+    load_clinical_config,
+)
 from ddxdriver.history_taking_agents.llm_history_taking import LLMHistoryTaking
 from ddxdriver.utils import DialogueHistory, OutputDict, Patient
 
@@ -95,8 +101,14 @@ def test_clinical_history_waits_for_real_patient_answer_and_preserves_initial_pa
         "History-derived patient profile:\n"
         "- Headache for one day\n- Reports fever"
     )
+    assert session.turns == [{"question": "Any fever?", "answer": "Yes"}]
     assert patient.patient_profile == profile
     assert session.dialogue_history == "Doctor: Any fever?\nPatient: Yes\n"
+
+    patient.patient_initial_info = "Headache for one day\nTemperature: 39 C\nCT head: Normal"
+    refreshed = session.refresh_initial_context()
+    assert "CT head: Normal" in refreshed
+    assert "- Reports fever" in refreshed
 
 
 def test_clinical_context_does_not_return_benchmark_fewshot_cases():
@@ -104,6 +116,28 @@ def test_clinical_context_does_not_return_benchmark_fewshot_cases():
     assert context.SPECIALIST_PREFACE == "You are a medical doctor."
     assert context.DDX_LENGTH == 5
     assert context.get_fewshot(Patient(), {"type": "dynamic", "num_shots": 5}) == []
+
+
+def test_clinical_config_is_pubmed_and_has_no_benchmark_patient_agent():
+    config = load_clinical_config()
+    assert config["rag"]["config"]["corpus_name"] == "PubMed"
+    assert config["diagnosis"]["config"]["fewshot"]["type"] == "none"
+    assert "patient" not in config
+
+
+def test_clinical_driver_config_removes_simulated_history_agent():
+    session = ClinicalSession.__new__(ClinicalSession)
+    session.ddxdriver_cfg = {
+        "class_name": "ddxdriver.ddxdrivers.open_choice.OpenChoice",
+        "config": {
+            "available_agents": ["history_taking", "rag", "diagnosis"],
+            "max_turns": 6,
+        },
+    }
+    session.rag_agent_cfg = {"class_name": "fake.RAG", "config": {}}
+
+    config = session._clinical_driver_cfg()
+    assert config["config"]["available_agents"] == ["rag", "diagnosis"]
 
 
 def test_clinical_result_contains_only_real_driver_outputs():
