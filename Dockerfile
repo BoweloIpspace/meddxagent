@@ -14,12 +14,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000
 
+WORKDIR /app
 RUN python -m pip install --no-cache-dir uv
 
 COPY --from=builder /src/dist/*.whl /tmp/
 RUN uv pip install --system torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu \
     && uv pip install --system /tmp/*.whl \
-    && rm -f /tmp/*.whl
+    && rm -f /tmp/*.whl \
+    && useradd --create-home --uid 10001 meddx
+
+USER meddx
 
 EXPOSE 8000
 
