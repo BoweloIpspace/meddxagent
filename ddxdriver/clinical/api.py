@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -103,7 +104,7 @@ class BaseHandler(tornado.web.RequestHandler):
             self.write_api_error(400, str(exc))
             return None
         except Exception:
-            self.application.log_exception(*__import__("sys").exc_info())
+            self.log_exception(*sys.exc_info())
             self.write_api_error(500, "MEDDxAgent request failed")
             return None
 
@@ -126,7 +127,7 @@ class SessionsHandler(BaseHandler):
             self.write_api_error(400, str(exc))
             return
         except Exception:
-            self.application.log_exception(*__import__("sys").exc_info())
+            self.log_exception(*sys.exc_info())
             self.write_api_error(500, "Unable to create MEDDxAgent clinical session")
             return
 
