@@ -35,11 +35,13 @@ class ClinicalHistorySession:
         self.profile_model = profile_model
         self.conversation_goals = conversation_goals
         self.complete = False
+        self.derived_profile = ""
 
     def reset(self) -> None:
         self.history_taking_agent.dialogue_history.reset()
         self.patient.patient_profile = None
         self.complete = False
+        self.derived_profile = ""
 
     @property
     def dialogue_history(self) -> str:
@@ -93,6 +95,23 @@ class ClinicalHistorySession:
             raise RuntimeError("History taking is already complete")
         self.history_taking_agent.record_patient_answer(answer)
 
+    def _compose_profile(self) -> str:
+        profile_parts = [
+            "Clinical information available before history:\n"
+            + self.patient.patient_initial_info.strip()
+        ]
+        if self.derived_profile.strip():
+            profile_parts.append(
+                "History-derived patient profile:\n" + self.derived_profile.strip()
+            )
+        return "\n\n".join(profile_parts)
+
+    def refresh_initial_context(self) -> str:
+        """Recompose the profile after exam/investigation data updates initial info."""
+        profile = self._compose_profile()
+        self.patient.patient_profile = profile
+        return profile
+
     def finish(self) -> str:
         """Build the patient profile consumed by retrieval/diagnosis and return it.
 
@@ -103,24 +122,15 @@ class ClinicalHistorySession:
         if self.pending_question is not None:
             raise RuntimeError("Cannot finish history while a question is waiting for a patient response")
 
-        derived_profile = ""
         if self.dialogue_history:
-            derived_profile = dialogue_to_patient_profile(
+            self.derived_profile = dialogue_to_patient_profile(
                 dialogue_history_text=self.dialogue_history,
                 patient=self.patient,
                 model=self.profile_model,
             )
-            if not isinstance(derived_profile, str):
+            if not isinstance(self.derived_profile, str):
                 raise TypeError("MEDDxAgent history-derived patient profile must be a string")
 
-        profile_parts = [
-            "Clinical information available before history:\n"
-            + self.patient.patient_initial_info.strip()
-        ]
-        if derived_profile.strip():
-            profile_parts.append("History-derived patient profile:\n" + derived_profile.strip())
-
-        profile = "\n\n".join(profile_parts)
-        self.patient.patient_profile = profile
+        profile = self.refresh_initial_context()
         self.complete = True
         return profile
