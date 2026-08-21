@@ -70,10 +70,10 @@ def test_original_history_call_still_runs_simulated_loop():
     )
 
 
-def test_clinical_history_waits_for_real_patient_answer_and_builds_profile():
-    patient = Patient(patient_initial_info="Headache for one day")
+def test_clinical_history_waits_for_real_patient_answer_and_preserves_initial_payload():
+    patient = Patient(patient_initial_info="Headache for one day\nTemperature: 39 C")
     history = FakeInteractiveHistory(["Any fever?", None])
-    profile_model = SequenceModel(["- Headache for one day\n- No fever"])
+    profile_model = SequenceModel(["- Headache for one day\n- Reports fever"])
     session = ClinicalHistorySession(
         patient=patient,
         history_taking_agent=history,
@@ -84,14 +84,19 @@ def test_clinical_history_waits_for_real_patient_answer_and_builds_profile():
     assert session.next_question() == "Any fever?"
     assert session.pending_question == "Any fever?"
 
-    session.submit_answer("No")
+    session.submit_answer("Yes")
     assert session.pending_question is None
     assert session.next_question() is None
 
     profile = session.finish()
-    assert profile == "- Headache for one day\n- No fever"
+    assert profile == (
+        "Clinical information available before history:\n"
+        "Headache for one day\nTemperature: 39 C\n\n"
+        "History-derived patient profile:\n"
+        "- Headache for one day\n- Reports fever"
+    )
     assert patient.patient_profile == profile
-    assert session.dialogue_history == "Doctor: Any fever?\nPatient: No\n"
+    assert session.dialogue_history == "Doctor: Any fever?\nPatient: Yes\n"
 
 
 def test_clinical_context_does_not_return_benchmark_fewshot_cases():
