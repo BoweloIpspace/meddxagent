@@ -3,7 +3,8 @@ name: Clinical runtime
 on:
   push:
     branches:
-      - agent/clinical-runtime
+      - main
+      - "agent/**"
   pull_request:
     branches:
       - main
