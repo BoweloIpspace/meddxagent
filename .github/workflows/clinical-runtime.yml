@@ -31,3 +31,23 @@ jobs:
 
       - name: Run clinical adapter tests
         run: uv run pytest -q tests/test_clinical_runtime.py tests/test_clinical_api.py
+
+      - name: Build and inspect deployable wheel
+        run: |
+          uv build --wheel
+          uv run python - <<'PY'
+          import glob
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+              assert "ddxdriver/clinical/api.py" in names
+              assert "ddxdriver/clinical/clinical.yml" in names
+              assert "ddxdriver/ddxdrivers/open_choice.py" in names
+              entry_points = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
+              assert len(entry_points) == 1
+              content = archive.read(entry_points[0]).decode("utf-8")
+              assert "meddx-clinical-api = ddxdriver.clinical.api:main" in content
+          PY
