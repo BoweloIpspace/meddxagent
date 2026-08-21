@@ -1,4 +1,5 @@
 import json
+import os
 from unittest.mock import patch
 
 from tornado.testing import AsyncHTTPTestCase
@@ -82,6 +83,21 @@ class TestClinicalApi(AsyncHTTPTestCase):
         response = self.fetch("/api/v1/health")
         assert response.code == 200
         assert json.loads(response.body) == {"status": "ok"}
+
+    def test_readiness_reports_missing_model_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.fetch("/api/v1/ready")
+        assert response.code == 503
+        assert json.loads(response.body) == {
+            "status": "not_ready",
+            "missing_environment": ["OAI_KEY"],
+        }
+
+    def test_readiness_is_ready_when_model_environment_is_present(self):
+        with patch.dict(os.environ, {"OAI_KEY": "test-key"}, clear=True):
+            response = self.fetch("/api/v1/ready")
+        assert response.code == 200
+        assert json.loads(response.body) == {"status": "ready"}
 
     def test_missing_session_is_404(self):
         response = self.fetch("/api/v1/clinical/sessions/does-not-exist")
