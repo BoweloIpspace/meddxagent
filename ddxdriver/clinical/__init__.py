@@ -8,10 +8,12 @@ history taking, and serialization of genuine DDxDriver outputs.
 from .context import ClinicalContext
 from .history import ClinicalHistorySession
 from .results import ClinicalResult, collect_clinical_result
+from .session import ClinicalSession
 
 __all__ = [
     "ClinicalContext",
     "ClinicalHistorySession",
     "ClinicalResult",
+    "ClinicalSession",
     "collect_clinical_result",
 ]
