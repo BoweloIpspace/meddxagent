@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from Bio import Entrez
+
 from ddxdriver.clinical import (
     ClinicalContext,
     ClinicalHistorySession,
@@ -9,6 +11,7 @@ from ddxdriver.clinical import (
 )
 from ddxdriver.clinical.config import DEFAULT_CLINICAL_CONFIG
 from ddxdriver.history_taking_agents.llm_history_taking import LLMHistoryTaking
+from ddxdriver.rag_agents._searchrag_utils import _configure_entrez
 from ddxdriver.utils import DialogueHistory, OutputDict, Patient
 
 
@@ -135,6 +138,15 @@ def test_default_clinical_config_is_packaged_and_matches_repo_mirror():
     assert DEFAULT_CLINICAL_CONFIG.read_text(encoding="utf-8") == repo_config.read_text(
         encoding="utf-8"
     )
+
+
+def test_pubmed_entrez_uses_environment_identity(monkeypatch):
+    monkeypatch.setenv("NCBI_EMAIL", "clinical@example.com")
+    monkeypatch.setenv("NCBI_API_KEY", "test-ncbi-key")
+
+    assert _configure_entrez() == "clinical@example.com"
+    assert Entrez.email == "clinical@example.com"
+    assert Entrez.api_key == "test-ncbi-key"
 
 
 def test_clinical_driver_config_removes_simulated_history_agent():
