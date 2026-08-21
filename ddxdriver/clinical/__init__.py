@@ -5,6 +5,7 @@ needed by a clinician-facing application: a benchmark-free context, resumable
 history taking, and serialization of genuine DDxDriver outputs.
 """
 
+from .config import create_clinical_session, load_clinical_config
 from .context import ClinicalContext
 from .history import ClinicalHistorySession
 from .results import ClinicalResult, collect_clinical_result
@@ -16,4 +17,6 @@ __all__ = [
     "ClinicalResult",
     "ClinicalSession",
     "collect_clinical_result",
+    "create_clinical_session",
+    "load_clinical_config",
 ]
