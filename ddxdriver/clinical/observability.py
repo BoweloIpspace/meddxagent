@@ -13,6 +13,19 @@ from typing import Any
 
 LOGGER_NAME = "meddxagent.clinical"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+SENSITIVE_FIELD_NAMES = {
+    "answer",
+    "body",
+    "diagnosis",
+    "dialogue_history",
+    "patient_initial_info",
+    "patient_profile",
+    "prompt",
+    "question",
+    "rag_content",
+    "rationale",
+    "result",
+}
 
 
 def _utc_timestamp() -> str:
@@ -70,7 +83,7 @@ def build_event(event: str, **fields: Any) -> dict[str, Any]:
         "event": event,
     }
     for key, value in fields.items():
-        if value is not None:
+        if value is not None and key not in SENSITIVE_FIELD_NAMES:
             payload[key] = value
     return payload
 
