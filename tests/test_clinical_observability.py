@@ -69,16 +69,15 @@ class TestClinicalObservabilityHttp(AsyncHTTPTestCase):
         super().tearDown()
         self._tmpdir.cleanup()
 
-    def test_error_response_carries_request_id(self):
+    def test_error_response_preserves_contract_and_exposes_request_id_header(self):
         response = self.fetch(
             "/api/v1/clinical/sessions/missing-session",
             headers={"X-Request-ID": "trace-missing-1"},
         )
 
         assert response.code == 404
-        body = json.loads(response.body)
-        assert body["error"] == "Clinical session not found"
-        assert body["request_id"] == "trace-missing-1"
+        assert json.loads(response.body) == {"error": "Clinical session not found"}
+        assert response.headers.get("X-Request-ID") == "trace-missing-1"
 
     def test_request_id_is_exposed_as_response_header(self):
         response = self.fetch(
