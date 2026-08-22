@@ -33,6 +33,20 @@ jobs:
       - name: Run clinical adapter tests
         run: uv run pytest -q tests/test_clinical_runtime.py tests/test_clinical_api.py
 
+      - name: Validate Railway deployment config
+        run: |
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          config = tomllib.loads(Path("railway.toml").read_text(encoding="utf-8"))
+          assert config["build"]["builder"] == "DOCKERFILE"
+          assert config["deploy"]["healthcheckPath"] == "/api/v1/health"
+          assert config["deploy"]["healthcheckTimeout"] == 300
+          assert config["deploy"]["restartPolicyType"] == "ON_FAILURE"
+          assert config["deploy"]["restartPolicyMaxRetries"] == 10
+          PY
+
       - name: Build and inspect deployable wheel
         run: |
           uv build --wheel
