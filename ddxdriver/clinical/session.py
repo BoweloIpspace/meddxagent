@@ -12,6 +12,9 @@ from .history import ClinicalHistorySession
 from .results import ClinicalResult, collect_clinical_result
 
 
+CLINICAL_SESSION_STATE_VERSION = 1
+
+
 class ClinicalSession:
     """Small application adapter around the existing MEDDxAgent components.
 
@@ -163,6 +166,107 @@ class ClinicalSession:
             dialogue_history=self.history.dialogue_history if self.history else "",
         )
         return self.result
+
+    def persistence_state(self) -> dict:
+        """Return the minimum JSON-serializable state needed to resume this session.
+
+        Runtime model/agent instances are deliberately not serialized. They are rebuilt
+        from the clinical configuration and this state is replayed onto the fresh adapter.
+        """
+        history_state = None
+        if self.history is not None:
+            history_state = {
+                "dialogue": [
+                    [role, content]
+                    for role, content in self.history.history_taking_agent.dialogue_history.dialogue_history
+                ],
+                "complete": self.history.complete,
+                "derived_profile": self.history.derived_profile,
+                "conversation_goals": self.history.conversation_goals,
+            }
+
+        return {
+            "version": CLINICAL_SESSION_STATE_VERSION,
+            "patient": {
+                "patient_id": self.patient.patient_id,
+                "patient_initial_info": self.patient.patient_initial_info,
+                "patient_profile": self.patient.patient_profile or "",
+            },
+            "history": history_state,
+            "result": self.result.to_dict() if self.result else None,
+        }
+
+    def restore_persistence_state(self, state: dict) -> None:
+        """Restore a state produced by :meth:`persistence_state` onto this adapter."""
+        if not isinstance(state, dict):
+            raise TypeError("Clinical session persistence state must be a mapping")
+        if state.get("version") != CLINICAL_SESSION_STATE_VERSION:
+            raise ValueError("Unsupported clinical session persistence state version")
+
+        patient_state = state.get("patient")
+        if not isinstance(patient_state, dict):
+            raise ValueError("Clinical session persistence state is missing patient data")
+
+        patient_initial_info = patient_state.get("patient_initial_info")
+        if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
+            raise ValueError("Persisted clinical session has invalid patient initial information")
+
+        self.patient.patient_id = patient_state.get("patient_id", self.patient.patient_id)
+        self.patient.patient_initial_info = patient_initial_info.strip()
+        patient_profile = patient_state.get("patient_profile", "")
+        if patient_profile is None:
+            patient_profile = ""
+        if not isinstance(patient_profile, str):
+            raise TypeError("Persisted clinical session patient profile must be a string")
+
+        history_state = state.get("history")
+        if history_state is not None:
+            if self.history is None:
+                raise ValueError("Persisted session requires a history-taking configuration")
+            if not isinstance(history_state, dict):
+                raise TypeError("Persisted clinical history state must be a mapping")
+
+            dialogue = history_state.get("dialogue", [])
+            if not isinstance(dialogue, list):
+                raise TypeError("Persisted clinical history dialogue must be a list")
+
+            self.history.history_taking_agent.dialogue_history.reset()
+            for entry in dialogue:
+                if not isinstance(entry, list) or len(entry) != 2:
+                    raise ValueError("Persisted clinical history dialogue entry is invalid")
+                role, content = entry
+                if not isinstance(role, str) or not isinstance(content, str):
+                    raise TypeError("Persisted clinical history dialogue values must be strings")
+                self.history.history_taking_agent.dialogue_history.add_dialogue((role, content))
+
+            self.history.complete = bool(history_state.get("complete", False))
+            derived_profile = history_state.get("derived_profile", "")
+            conversation_goals = history_state.get("conversation_goals", "")
+            if not isinstance(derived_profile, str) or not isinstance(conversation_goals, str):
+                raise TypeError("Persisted clinical history text fields must be strings")
+            self.history.derived_profile = derived_profile
+            self.history.conversation_goals = conversation_goals
+        elif self.history is not None:
+            self.history.reset()
+
+        self.patient.patient_profile = patient_profile
+        self.driver = None
+
+        result_state = state.get("result")
+        if result_state is None:
+            self.result = None
+        else:
+            if not isinstance(result_state, dict):
+                raise TypeError("Persisted clinical result must be a mapping")
+            self.result = ClinicalResult(
+                ranked_differential=deepcopy(result_state.get("ranked_differential", [])),
+                rationale=result_state.get("rationale", ""),
+                dialogue_history=result_state.get("dialogue_history", ""),
+                rag_content=result_state.get("rag_content", ""),
+                intermediate_differentials=deepcopy(
+                    result_state.get("intermediate_differentials", [])
+                ),
+            )
 
     def snapshot(self) -> dict:
         return {
