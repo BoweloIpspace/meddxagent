@@ -9,6 +9,7 @@ import tornado.ioloop
 import tornado.web
 
 from .config import create_clinical_session, load_clinical_config
+from .persistence import SQLiteClinicalSessionRepository
 
 
 def missing_runtime_environment(config: dict) -> list[str]:
@@ -30,16 +31,19 @@ def missing_runtime_environment(config: dict) -> list[str]:
 
 
 class ClinicalSessionStore:
-    """Process-local session storage for the first frontend integration.
+    """Resumable clinical session storage with an in-process hot cache.
 
-    Persistence is intentionally outside this first integration slice. The API
-    contract can stay the same when durable storage is added later.
+    Session state is serialized to SQLite after each successful mutation. Runtime
+    model/agent objects remain in memory while the process is alive and are rebuilt
+    from persisted state when a session is requested after a process restart.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, repository: SQLiteClinicalSessionRepository | None = None):
         self.config = config
-        self.sessions = {}
+        self.repository = repository or SQLiteClinicalSessionRepository()
+        self.sessions: dict[str, object] = {}
         self.locks: dict[str, asyncio.Lock] = {}
+        self._load_lock = asyncio.Lock()
 
     async def create(self, patient_initial_info: str, patient_id=None) -> tuple[str, object]:
         session_id = str(uuid.uuid4())
@@ -51,18 +55,62 @@ class ClinicalSessionStore:
         )
         self.sessions[session_id] = session
         self.locks[session_id] = asyncio.Lock()
+        try:
+            await self.persist(session_id, session)
+        except Exception:
+            self.sessions.pop(session_id, None)
+            self.locks.pop(session_id, None)
+            raise
         return session_id, session
 
-    def get(self, session_id: str):
+    async def get(self, session_id: str):
         session = self.sessions.get(session_id)
-        if session is None:
-            raise KeyError(session_id)
-        return session
+        if session is not None:
+            return session
+
+        async with self._load_lock:
+            session = self.sessions.get(session_id)
+            if session is not None:
+                return session
+
+            state = await asyncio.to_thread(self.repository.load, session_id)
+            if state is None:
+                raise KeyError(session_id)
+
+            patient_state = state.get("patient")
+            if not isinstance(patient_state, dict):
+                raise ValueError("Persisted clinical session is missing patient state")
+            patient_initial_info = patient_state.get("patient_initial_info")
+            if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
+                raise ValueError("Persisted clinical session has invalid patient initial information")
+            patient_id = patient_state.get("patient_id", session_id)
+
+            session = await asyncio.to_thread(
+                create_clinical_session,
+                patient_initial_info,
+                patient_id,
+                self.config,
+            )
+            restore = getattr(session, "restore_persistence_state", None)
+            if not callable(restore):
+                raise TypeError("Clinical session implementation cannot restore persisted state")
+            await asyncio.to_thread(restore, state)
+
+            self.sessions[session_id] = session
+            self.locks.setdefault(session_id, asyncio.Lock())
+            return session
 
     def lock(self, session_id: str) -> asyncio.Lock:
-        if session_id not in self.locks:
+        if session_id not in self.sessions:
             raise KeyError(session_id)
-        return self.locks[session_id]
+        return self.locks.setdefault(session_id, asyncio.Lock())
+
+    async def persist(self, session_id: str, session) -> None:
+        serialize = getattr(session, "persistence_state", None)
+        if not callable(serialize):
+            return
+        state = await asyncio.to_thread(serialize)
+        await asyncio.to_thread(self.repository.save, session_id, state)
 
 
 class BaseHandler(tornado.web.RequestHandler):
@@ -107,17 +155,23 @@ class BaseHandler(tornado.web.RequestHandler):
         self.set_status(status)
         self.finish({"error": message})
 
-    async def run_session_action(self, session_id: str, action):
+    async def run_session_action(self, session_id: str, action, persist: bool = True):
         try:
-            session = self.store.get(session_id)
+            session = await self.store.get(session_id)
             lock = self.store.lock(session_id)
         except KeyError:
             self.write_api_error(404, "Clinical session not found")
             return None
+        except (ValueError, TypeError) as exc:
+            self.write_api_error(500, str(exc))
+            return None
 
         try:
             async with lock:
-                return await asyncio.to_thread(action, session)
+                result = await asyncio.to_thread(action, session)
+                if persist:
+                    await self.store.persist(session_id, session)
+                return result
         except (ValueError, RuntimeError, TypeError) as exc:
             self.write_api_error(400, str(exc))
             return None
@@ -176,7 +230,11 @@ class SessionsHandler(BaseHandler):
 
 class SessionHandler(BaseHandler):
     async def get(self, session_id: str):
-        result = await self.run_session_action(session_id, lambda session: session.snapshot())
+        result = await self.run_session_action(
+            session_id,
+            lambda session: session.snapshot(),
+            persist=False,
+        )
         if result is not None:
             self.finish({"session_id": session_id, **result})
 
@@ -255,9 +313,12 @@ class RunHandler(BaseHandler):
             self.finish({"session_id": session_id, **result})
 
 
-def make_app(config_path: str | Path | None = None) -> tornado.web.Application:
+def make_app(
+    config_path: str | Path | None = None,
+    session_repository: SQLiteClinicalSessionRepository | None = None,
+) -> tornado.web.Application:
     config = load_clinical_config(config_path)
-    store = ClinicalSessionStore(config)
+    store = ClinicalSessionStore(config, repository=session_repository)
     routes = [
         (r"/api/v1/health", HealthHandler, {"store": store}),
         (r"/api/v1/ready", ReadinessHandler, {"store": store}),
