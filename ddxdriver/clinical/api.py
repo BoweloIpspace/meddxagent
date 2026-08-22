@@ -1,7 +1,8 @@
 import asyncio
 import json
+import logging
 import os
-import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -9,6 +10,14 @@ import tornado.ioloop
 import tornado.web
 
 from .config import create_clinical_session, load_clinical_config
+from .observability import (
+    build_error_event,
+    build_event,
+    configure_observability,
+    emit_event,
+    request_id_from_header,
+    session_reference,
+)
 from .persistence import SQLiteClinicalSessionRepository
 
 
@@ -116,6 +125,8 @@ class ClinicalSessionStore:
 class BaseHandler(tornado.web.RequestHandler):
     def initialize(self, store: ClinicalSessionStore):
         self.store = store
+        self.request_id = request_id_from_header(self.request.headers.get("X-Request-ID"))
+        self._request_started = time.monotonic()
 
     def set_default_headers(self):
         allowed = {
@@ -132,9 +143,30 @@ class BaseHandler(tornado.web.RequestHandler):
         elif origin in allowed:
             self.set_header("Access-Control-Allow-Origin", origin)
             self.set_header("Vary", "Origin")
-        self.set_header("Access-Control-Allow-Headers", "Content-Type")
+        self.set_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
         self.set_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.set_header("Access-Control-Expose-Headers", "X-Request-ID")
+        if hasattr(self, "request_id"):
+            self.set_header("X-Request-ID", self.request_id)
         self.set_header("Content-Type", "application/json")
+
+    def on_finish(self):
+        if not hasattr(self, "_request_started"):
+            return
+        duration_ms = round((time.monotonic() - self._request_started) * 1000, 1)
+        level = logging.DEBUG if isinstance(self, HealthHandler) else logging.INFO
+        emit_event(
+            build_event(
+                "http.request",
+                request_id=self.request_id,
+                handler=type(self).__name__,
+                method=self.request.method,
+                status=self.get_status(),
+                duration_ms=duration_ms,
+                outcome="success" if self.get_status() < 400 else "error",
+            ),
+            level=level,
+        )
 
     def options(self, *args, **kwargs):
         self.set_status(204)
@@ -153,17 +185,61 @@ class BaseHandler(tornado.web.RequestHandler):
 
     def write_api_error(self, status: int, message: str):
         self.set_status(status)
-        self.finish({"error": message})
+        self.finish({"error": message, "request_id": self.request_id})
 
-    async def run_session_action(self, session_id: str, action, persist: bool = True):
+    def monitor_error(self, operation: str, error: BaseException, session_id: str | None = None):
+        emit_event(
+            build_error_event(
+                "clinical.error",
+                error,
+                request_id=self.request_id,
+                operation=operation,
+                session_ref=session_reference(session_id),
+            ),
+            level=logging.ERROR,
+        )
+
+    async def audit_event(
+        self,
+        action: str,
+        outcome: str,
+        session_id: str | None = None,
+        **metadata,
+    ) -> None:
+        emit_event(
+            build_event(
+                "clinical.audit",
+                request_id=self.request_id,
+                action=action,
+                outcome=outcome,
+                session_ref=session_reference(session_id),
+                **metadata,
+            )
+        )
+
+    async def run_session_action(
+        self,
+        session_id: str,
+        action,
+        audit_action: str,
+        persist: bool = True,
+    ):
         try:
             session = await self.store.get(session_id)
             lock = self.store.lock(session_id)
         except KeyError:
+            await self.audit_event(audit_action, "not_found", session_id)
             self.write_api_error(404, "Clinical session not found")
             return None
         except (ValueError, TypeError) as exc:
-            self.write_api_error(500, str(exc))
+            self.monitor_error(audit_action, exc, session_id)
+            await self.audit_event(
+                audit_action,
+                "error",
+                session_id,
+                error_type=type(exc).__name__,
+            )
+            self.write_api_error(500, "Stored clinical session could not be restored")
             return None
 
         try:
@@ -171,12 +247,25 @@ class BaseHandler(tornado.web.RequestHandler):
                 result = await asyncio.to_thread(action, session)
                 if persist:
                     await self.store.persist(session_id, session)
+                await self.audit_event(audit_action, "success", session_id)
                 return result
         except (ValueError, RuntimeError, TypeError) as exc:
+            await self.audit_event(
+                audit_action,
+                "rejected",
+                session_id,
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(400, str(exc))
             return None
-        except Exception:
-            self.log_exception(*sys.exc_info())
+        except Exception as exc:
+            self.monitor_error(audit_action, exc, session_id)
+            await self.audit_event(
+                audit_action,
+                "error",
+                session_id,
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(500, "MEDDxAgent request failed")
             return None
 
@@ -200,11 +289,13 @@ class SessionsHandler(BaseHandler):
     async def post(self):
         missing = missing_runtime_environment(self.store.config)
         if missing:
+            await self.audit_event("session.create", "backend_not_ready")
             self.set_status(503)
             self.finish(
                 {
                     "error": "MEDDxAgent backend is not ready",
                     "missing_environment": missing,
+                    "request_id": self.request_id,
                 }
             )
             return
@@ -217,13 +308,24 @@ class SessionsHandler(BaseHandler):
             patient_id = payload.get("patient_id")
             session_id, session = await self.store.create(patient_initial_info, patient_id)
         except (ValueError, TypeError) as exc:
+            await self.audit_event(
+                "session.create",
+                "rejected",
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(400, str(exc))
             return
-        except Exception:
-            self.log_exception(*sys.exc_info())
+        except Exception as exc:
+            self.monitor_error("session.create", exc)
+            await self.audit_event(
+                "session.create",
+                "error",
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(500, "Unable to create MEDDxAgent clinical session")
             return
 
+        await self.audit_event("session.create", "success", session_id)
         self.set_status(201)
         self.finish({"session_id": session_id, **session.snapshot()})
 
@@ -233,6 +335,7 @@ class SessionHandler(BaseHandler):
         result = await self.run_session_action(
             session_id,
             lambda session: session.snapshot(),
+            audit_action="session.read",
             persist=False,
         )
         if result is not None:
@@ -247,6 +350,12 @@ class ContextHandler(BaseHandler):
             if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
                 raise ValueError("patient_initial_info is required")
         except (ValueError, TypeError) as exc:
+            await self.audit_event(
+                "context.update",
+                "rejected",
+                session_id,
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(400, str(exc))
             return
 
@@ -254,7 +363,11 @@ class ContextHandler(BaseHandler):
             session.update_patient_initial_info(patient_initial_info)
             return session.snapshot()
 
-        result = await self.run_session_action(session_id, update_context)
+        result = await self.run_session_action(
+            session_id,
+            update_context,
+            audit_action="context.update",
+        )
         if result is not None:
             self.finish({"session_id": session_id, **result})
 
@@ -265,7 +378,11 @@ class NextQuestionHandler(BaseHandler):
             question = session.next_question()
             return question, session.snapshot()
 
-        result = await self.run_session_action(session_id, generate)
+        result = await self.run_session_action(
+            session_id,
+            generate,
+            audit_action="history.question.generate",
+        )
         if result is not None:
             question, snapshot = result
             self.finish({"session_id": session_id, "question": question, **snapshot})
@@ -279,6 +396,12 @@ class AnswerHandler(BaseHandler):
             if not isinstance(answer, str) or not answer.strip():
                 raise ValueError("answer is required")
         except (ValueError, TypeError) as exc:
+            await self.audit_event(
+                "history.answer.submit",
+                "rejected",
+                session_id,
+                error_type=type(exc).__name__,
+            )
             self.write_api_error(400, str(exc))
             return
 
@@ -286,7 +409,11 @@ class AnswerHandler(BaseHandler):
             session.submit_answer(answer)
             return session.snapshot()
 
-        result = await self.run_session_action(session_id, submit)
+        result = await self.run_session_action(
+            session_id,
+            submit,
+            audit_action="history.answer.submit",
+        )
         if result is not None:
             self.finish({"session_id": session_id, **result})
 
@@ -297,7 +424,11 @@ class FinishHistoryHandler(BaseHandler):
             session.finish_history()
             return session.snapshot()
 
-        result = await self.run_session_action(session_id, finish_history)
+        result = await self.run_session_action(
+            session_id,
+            finish_history,
+            audit_action="history.finish",
+        )
         if result is not None:
             self.finish({"session_id": session_id, **result})
 
@@ -308,7 +439,11 @@ class RunHandler(BaseHandler):
             session.run()
             return session.snapshot()
 
-        result = await self.run_session_action(session_id, run)
+        result = await self.run_session_action(
+            session_id,
+            run,
+            audit_action="diagnosis.run",
+        )
         if result is not None:
             self.finish({"session_id": session_id, **result})
 
@@ -317,6 +452,7 @@ def make_app(
     config_path: str | Path | None = None,
     session_repository: SQLiteClinicalSessionRepository | None = None,
 ) -> tornado.web.Application:
+    configure_observability()
     config = load_clinical_config(config_path)
     store = ClinicalSessionStore(config, repository=session_repository)
     routes = [
@@ -334,11 +470,12 @@ def make_app(
 
 
 def main():
+    configure_observability()
     config_path = os.getenv("MEDDX_CLINICAL_CONFIG")
     port = int(os.getenv("PORT", "8000"))
     app = make_app(config_path)
     app.listen(port)
-    print(f"MEDDxAgent clinical API listening on port {port}")
+    emit_event(build_event("service.started", port=port))
     tornado.ioloop.IOLoop.current().start()
 
 
