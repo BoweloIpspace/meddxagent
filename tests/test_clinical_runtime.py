@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from Bio import Entrez
 
 from ddxdriver.clinical import (
@@ -80,6 +81,25 @@ def test_original_history_call_still_runs_simulated_loop():
         "Patient: Yesterday\n"
         "Doctor: None\n"
     )
+
+
+def test_history_question_surfaces_terminal_model_error_tuple():
+    agent = LLMHistoryTaking.__new__(LLMHistoryTaking)
+    agent.max_questions = 3
+    agent.dialogue_history = DialogueHistory()
+    agent.model = SequenceModel(
+        [
+            (
+                "error:Exception in calling OpenAI: 401 invalid_api_key",
+                {"input": "prompt", "output": "error"},
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="401 invalid_api_key"):
+        agent.generate_question(patient_initial_info="Headache")
+
+    assert agent.dialogue_history.dialogue_history == []
 
 
 def test_clinical_history_waits_for_real_patient_answer_and_preserves_initial_payload():
