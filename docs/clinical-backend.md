@@ -56,6 +56,37 @@ The server reads `PORT`, defaulting to `8000`.
 
 A host-agnostic `Dockerfile` is included for deployment platforms that build containers.
 
+## Railway deployment
+
+The repository includes `railway.toml` for the first connected clinical deployment. Railway is configured to:
+
+- build the root `Dockerfile`
+- check `GET /api/v1/health` before promoting a deployment
+- allow up to 300 seconds for startup/health verification
+- restart on process failure
+
+Create one Railway service from `BoweloIpspace/meddxagent` using the `main` branch. Keep the service at its default single replica because clinical session state is process-local in this integration slice.
+
+Set these Railway service variables before testing the clinical API:
+
+```text
+OAI_KEY=<required>
+NCBI_EMAIL=<recommended>
+NCBI_API_KEY=<optional>
+MEDDX_ALLOWED_ORIGINS=https://meddxagentfrontend.vercel.app
+```
+
+Do not set a fixed `PORT` in Railway; the platform supplies it to the container.
+
+After Railway assigns a public domain, verify these in order:
+
+```text
+GET /api/v1/health  -> HTTP 200
+GET /api/v1/ready   -> HTTP 200
+```
+
+Only after both checks pass should the frontend production variable `VITE_MEDDX_API_URL` be set to the Railway service origin.
+
 ## Operational checks
 
 Liveness:
