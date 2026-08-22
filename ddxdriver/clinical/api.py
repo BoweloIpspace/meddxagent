@@ -6,6 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
+import tornado.httpserver
 import tornado.ioloop
 import tornado.web
 
@@ -19,6 +20,20 @@ from .observability import (
     session_reference,
 )
 from .persistence import SQLiteClinicalSessionRepository
+from .security import (
+    CLINICAL_API_PREFIX,
+    SESSION_CREATE_PATH,
+    SecurityConfig,
+    SlidingWindowRateLimiter,
+    client_rate_subject,
+    has_json_content_type,
+    is_model_action,
+    origin_is_allowed,
+    session_id_from_path,
+    session_rate_subject,
+    validate_patient_id,
+    validate_required_text,
+)
 
 
 def missing_runtime_environment(config: dict) -> list[str]:
@@ -129,25 +144,118 @@ class BaseHandler(tornado.web.RequestHandler):
         self._request_started = time.monotonic()
         self.set_header("X-Request-ID", self.request_id)
 
+    @property
+    def security_config(self) -> SecurityConfig:
+        return self.application.settings["meddx_security_config"]
+
+    @property
+    def rate_limiter(self) -> SlidingWindowRateLimiter:
+        return self.application.settings["meddx_rate_limiter"]
+
     def set_default_headers(self):
-        allowed = {
-            origin.strip()
-            for origin in os.getenv(
-                "MEDDX_ALLOWED_ORIGINS",
-                "http://localhost:5173,https://meddxagentfrontend.vercel.app",
-            ).split(",")
-            if origin.strip()
-        }
+        security_config = self.application.settings.get("meddx_security_config")
+        if not isinstance(security_config, SecurityConfig):
+            security_config = SecurityConfig.from_env()
+
         origin = self.request.headers.get("Origin")
-        if "*" in allowed:
+        if "*" in security_config.allowed_origins:
             self.set_header("Access-Control-Allow-Origin", "*")
-        elif origin in allowed:
+        elif origin in security_config.allowed_origins:
             self.set_header("Access-Control-Allow-Origin", origin)
             self.set_header("Vary", "Origin")
+
         self.set_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
         self.set_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.set_header("Access-Control-Expose-Headers", "X-Request-ID")
+        self.set_header(
+            "Access-Control-Expose-Headers",
+            "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining",
+        )
+        self.set_header("Access-Control-Max-Age", "600")
+        self.set_header("Cache-Control", "no-store, max-age=0")
+        self.set_header("Pragma", "no-cache")
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("X-Frame-Options", "DENY")
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.set_header(
+            "Content-Security-Policy",
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        )
         self.set_header("Content-Type", "application/json")
+
+    async def prepare(self):
+        origin = self.request.headers.get("Origin")
+        if not origin_is_allowed(origin, self.security_config):
+            await self.audit_event("request.origin", "rejected")
+            self.write_api_error(403, "Origin is not allowed")
+            return
+
+        if len(self.request.body) > self.security_config.max_body_bytes:
+            await self.audit_event("request.body", "rejected", body_too_large=True)
+            self.write_api_error(413, "Request body is too large")
+            return
+
+        if self.request.method == "OPTIONS" or not self.request.path.startswith(
+            CLINICAL_API_PREFIX
+        ):
+            return
+
+        general_decision = self.rate_limiter.check(
+            client_rate_subject(self.request.remote_ip),
+            self.security_config.requests_per_minute,
+        )
+        if not general_decision.allowed:
+            await self.reject_rate_limit("client", general_decision.retry_after_seconds)
+            return
+
+        if self.request.method == "POST" and self.request.path == SESSION_CREATE_PATH:
+            create_decision = self.rate_limiter.check(
+                client_rate_subject(self.request.remote_ip) + ":session-create",
+                self.security_config.session_creates_per_minute,
+            )
+            if not create_decision.allowed:
+                await self.reject_rate_limit(
+                    "session-create",
+                    create_decision.retry_after_seconds,
+                    limit=create_decision.limit,
+                )
+                return
+
+        if is_model_action(self.request.path, self.request.method):
+            session_id = session_id_from_path(self.request.path)
+            if session_id:
+                model_decision = self.rate_limiter.check(
+                    session_rate_subject(session_id) + ":model-action",
+                    self.security_config.model_actions_per_minute,
+                )
+                if not model_decision.allowed:
+                    await self.reject_rate_limit(
+                        "model-action",
+                        model_decision.retry_after_seconds,
+                        session_id=session_id,
+                        limit=model_decision.limit,
+                    )
+                    return
+
+    async def reject_rate_limit(
+        self,
+        scope: str,
+        retry_after_seconds: int,
+        *,
+        session_id: str | None = None,
+        limit: int | None = None,
+    ) -> None:
+        self.set_header("Retry-After", str(max(1, retry_after_seconds)))
+        if limit is not None:
+            self.set_header("X-RateLimit-Limit", str(limit))
+        self.set_header("X-RateLimit-Remaining", "0")
+        await self.audit_event(
+            "request.rate_limit",
+            "rejected",
+            session_id,
+            rate_limit_scope=scope,
+        )
+        self.write_api_error(429, "Too many requests. Please retry shortly.")
 
     def on_finish(self):
         if not hasattr(self, "_request_started"):
@@ -174,6 +282,8 @@ class BaseHandler(tornado.web.RequestHandler):
     def json_body(self) -> dict:
         if not self.request.body:
             return {}
+        if not has_json_content_type(self.request.headers.get("Content-Type")):
+            raise ValueError("Content-Type must be application/json")
         try:
             payload = json.loads(self.request.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -231,6 +341,11 @@ class BaseHandler(tornado.web.RequestHandler):
         audit_action: str,
         persist: bool = True,
     ):
+        if len(session_id) > 128:
+            await self.audit_event(audit_action, "not_found")
+            self.write_api_error(404, "Clinical session not found")
+            return None
+
         try:
             session = await self.store.get(session_id)
             lock = self.store.lock(session_id)
@@ -308,10 +423,15 @@ class SessionsHandler(BaseHandler):
 
         try:
             payload = self.json_body()
-            patient_initial_info = payload.get("patient_initial_info", "")
-            if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
-                raise ValueError("patient_initial_info is required")
-            patient_id = payload.get("patient_id")
+            patient_initial_info = validate_required_text(
+                payload.get("patient_initial_info", ""),
+                "patient_initial_info",
+                self.security_config.max_patient_info_chars,
+            )
+            patient_id = validate_patient_id(
+                payload.get("patient_id"),
+                self.security_config.max_patient_id_chars,
+            )
             session_id, session = await self.store.create(patient_initial_info, patient_id)
         except (ValueError, TypeError) as exc:
             await self.audit_event(
@@ -352,9 +472,11 @@ class ContextHandler(BaseHandler):
     async def post(self, session_id: str):
         try:
             payload = self.json_body()
-            patient_initial_info = payload.get("patient_initial_info", "")
-            if not isinstance(patient_initial_info, str) or not patient_initial_info.strip():
-                raise ValueError("patient_initial_info is required")
+            patient_initial_info = validate_required_text(
+                payload.get("patient_initial_info", ""),
+                "patient_initial_info",
+                self.security_config.max_patient_info_chars,
+            )
         except (ValueError, TypeError) as exc:
             await self.audit_event(
                 "context.update",
@@ -398,9 +520,11 @@ class AnswerHandler(BaseHandler):
     async def post(self, session_id: str):
         try:
             payload = self.json_body()
-            answer = payload.get("answer", "")
-            if not isinstance(answer, str) or not answer.strip():
-                raise ValueError("answer is required")
+            answer = validate_required_text(
+                payload.get("answer", ""),
+                "answer",
+                self.security_config.max_answer_chars,
+            )
         except (ValueError, TypeError) as exc:
             await self.audit_event(
                 "history.answer.submit",
@@ -457,9 +581,15 @@ class RunHandler(BaseHandler):
 def make_app(
     config_path: str | Path | None = None,
     session_repository: SQLiteClinicalSessionRepository | None = None,
+    security_config: SecurityConfig | None = None,
+    rate_limiter: SlidingWindowRateLimiter | None = None,
 ) -> tornado.web.Application:
     configure_observability()
     config = load_clinical_config(config_path)
+    security_config = security_config or SecurityConfig.from_env()
+    rate_limiter = rate_limiter or SlidingWindowRateLimiter(
+        max_keys=security_config.max_rate_limit_keys
+    )
     store = ClinicalSessionStore(config, repository=session_repository)
     routes = [
         (r"/api/v1/health", HealthHandler, {"store": store}),
@@ -472,16 +602,40 @@ def make_app(
         (r"/api/v1/clinical/sessions/([^/]+)/history/finish", FinishHistoryHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/run", RunHandler, {"store": store}),
     ]
-    return tornado.web.Application(routes)
+    return tornado.web.Application(
+        routes,
+        debug=False,
+        autoreload=False,
+        serve_traceback=False,
+        meddx_security_config=security_config,
+        meddx_rate_limiter=rate_limiter,
+    )
 
 
 def main():
     configure_observability()
     config_path = os.getenv("MEDDX_CLINICAL_CONFIG")
     port = int(os.getenv("PORT", "8000"))
-    app = make_app(config_path)
-    app.listen(port)
-    emit_event(build_event("service.started", port=port))
+    security_config = SecurityConfig.from_env()
+    app = make_app(config_path, security_config=security_config)
+    server = tornado.httpserver.HTTPServer(
+        app,
+        xheaders=False,
+        decompress_request=False,
+        max_body_size=security_config.max_body_bytes,
+        max_header_size=security_config.max_header_bytes,
+        body_timeout=security_config.body_timeout_seconds,
+        idle_connection_timeout=security_config.idle_connection_timeout_seconds,
+    )
+    server.listen(port)
+    emit_event(
+        build_event(
+            "service.started",
+            port=port,
+            rate_limiting=True,
+            max_body_bytes=security_config.max_body_bytes,
+        )
+    )
     tornado.ioloop.IOLoop.current().start()
 
 
