@@ -50,7 +50,21 @@ class LLMHistoryTaking(HistoryTaking):
             dialogue_history_text=self.dialogue_history.format_dialogue_history(),
             conversation_goals=conversation_goals,
         )
-        question = self.model(system_prompt=system_prompt, user_prompt=user_prompt)
+        model_result = self.model(system_prompt=system_prompt, user_prompt=user_prompt)
+        if isinstance(model_result, tuple):
+            error_text = (
+                model_result[0]
+                if model_result and isinstance(model_result[0], str)
+                else repr(model_result)
+            )
+            raise RuntimeError(f"History-taking model request failed: {error_text}")
+        if not isinstance(model_result, str):
+            raise TypeError(
+                "History-taking model returned an unsupported response type: "
+                f"{type(model_result).__name__}"
+            )
+
+        question = model_result
         log.info("Doctor: " + question + "\n")
 
         if question == "None":
