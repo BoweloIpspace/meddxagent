@@ -127,6 +127,7 @@ class BaseHandler(tornado.web.RequestHandler):
         self.store = store
         self.request_id = request_id_from_header(self.request.headers.get("X-Request-ID"))
         self._request_started = time.monotonic()
+        self.set_header("X-Request-ID", self.request_id)
 
     def set_default_headers(self):
         allowed = {
@@ -146,8 +147,6 @@ class BaseHandler(tornado.web.RequestHandler):
         self.set_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
         self.set_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.set_header("Access-Control-Expose-Headers", "X-Request-ID")
-        if hasattr(self, "request_id"):
-            self.set_header("X-Request-ID", self.request_id)
         self.set_header("Content-Type", "application/json")
 
     def on_finish(self):
@@ -206,6 +205,13 @@ class BaseHandler(tornado.web.RequestHandler):
         session_id: str | None = None,
         **metadata,
     ) -> None:
+        level = (
+            logging.ERROR
+            if outcome == "error"
+            else logging.WARNING
+            if outcome in {"rejected", "backend_not_ready"}
+            else logging.INFO
+        )
         emit_event(
             build_event(
                 "clinical.audit",
@@ -214,7 +220,8 @@ class BaseHandler(tornado.web.RequestHandler):
                 outcome=outcome,
                 session_ref=session_reference(session_id),
                 **metadata,
-            )
+            ),
+            level=level,
         )
 
     async def run_session_action(
