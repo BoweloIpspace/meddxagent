@@ -41,11 +41,13 @@ def _fake_create(patient_initial_info, patient_id, config):
 
 
 def _history(patient: Patient, dialogue: list[tuple[str, str]] | None = None):
+    dialogue_history = DialogueHistory()
+    if dialogue:
+        dialogue_history.add_dialogue(dialogue)
+
     history = ClinicalHistorySession.__new__(ClinicalHistorySession)
     history.patient = patient
-    history.history_taking_agent = SimpleNamespace(
-        dialogue_history=DialogueHistory(dialogue or [])
-    )
+    history.history_taking_agent = SimpleNamespace(dialogue_history=dialogue_history)
     history.complete = False
     history.derived_profile = ""
     history.conversation_goals = ""
