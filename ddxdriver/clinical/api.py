@@ -184,7 +184,7 @@ class BaseHandler(tornado.web.RequestHandler):
 
     def write_api_error(self, status: int, message: str):
         self.set_status(status)
-        self.finish({"error": message, "request_id": self.request_id})
+        self.finish({"error": message})
 
     def monitor_error(self, operation: str, error: BaseException, session_id: str | None = None):
         emit_event(
@@ -302,7 +302,6 @@ class SessionsHandler(BaseHandler):
                 {
                     "error": "MEDDxAgent backend is not ready",
                     "missing_environment": missing,
-                    "request_id": self.request_id,
                 }
             )
             return
