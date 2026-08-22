@@ -31,7 +31,7 @@ jobs:
           uv pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run clinical adapter tests
-        run: uv run pytest -q tests/test_clinical_runtime.py tests/test_clinical_api.py tests/test_clinical_persistence.py tests/test_clinical_observability.py
+        run: uv run pytest -q tests/test_clinical_runtime.py tests/test_clinical_api.py tests/test_clinical_persistence.py tests/test_clinical_observability.py tests/test_clinical_security.py
 
       - name: Validate Railway deployment config
         run: |
@@ -61,6 +61,7 @@ jobs:
               assert "ddxdriver/clinical/api.py" in names
               assert "ddxdriver/clinical/observability.py" in names
               assert "ddxdriver/clinical/persistence.py" in names
+              assert "ddxdriver/clinical/security.py" in names
               assert "ddxdriver/clinical/clinical.yml" in names
               assert "ddxdriver/ddxdrivers/open_choice.py" in names
               entry_points = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
