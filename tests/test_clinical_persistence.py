@@ -1,7 +1,10 @@
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from ddxdriver.clinical.api import ClinicalSessionStore
 from ddxdriver.clinical.history import ClinicalHistorySession
@@ -73,6 +76,47 @@ def test_sqlite_repository_round_trips_json_state(tmp_path):
     assert repository.load("missing") is None
 
 
+def test_sqlite_repository_latest_write_wins_and_delete_removes_state(tmp_path):
+    repository = SQLiteClinicalSessionRepository(tmp_path / "clinical.sqlite3")
+    first = {
+        "version": 1,
+        "patient": {
+            "patient_id": "CASE-LATEST",
+            "patient_initial_info": "Initial context",
+            "patient_profile": "",
+        },
+        "history": None,
+        "result": None,
+        "marker": "first",
+    }
+    second = {**first, "marker": "second"}
+
+    repository.save("session-latest", first)
+    repository.save("session-latest", second)
+
+    assert repository.load("session-latest")["marker"] == "second"
+
+    repository.delete("session-latest")
+    assert repository.load("session-latest") is None
+
+
+def test_sqlite_repository_rejects_corrupt_json_instead_of_returning_partial_state(tmp_path):
+    database_path = tmp_path / "clinical.sqlite3"
+    repository = SQLiteClinicalSessionRepository(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO clinical_sessions (session_id, state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("corrupt-session", "{not-json", "now", "now"),
+        )
+
+    with pytest.raises(json.JSONDecodeError):
+        repository.load("corrupt-session")
+
+
 def test_clinical_session_state_restores_history_and_result():
     patient = Patient(
         patient_id="CASE-2",
@@ -140,3 +184,45 @@ def test_session_store_rehydrates_after_process_cache_is_lost(tmp_path):
     assert restored.patient_id == "CASE-3"
     assert restored.patient_initial_info == "Chief complaint: Headache"
     assert restored.marker == "persisted after mutation"
+
+
+def test_session_store_rehydrates_the_latest_of_multiple_persisted_mutations(tmp_path):
+    database_path = tmp_path / "clinical.sqlite3"
+    first_store = ClinicalSessionStore(
+        {},
+        repository=SQLiteClinicalSessionRepository(database_path),
+    )
+
+    with patch("ddxdriver.clinical.api.create_clinical_session", side_effect=_fake_create):
+        session_id, session = asyncio.run(
+            first_store.create("Chief complaint: Abdominal pain", patient_id="CASE-4")
+        )
+
+    session.marker = "after history"
+    asyncio.run(first_store.persist(session_id, session))
+    session.marker = "after investigations"
+    asyncio.run(first_store.persist(session_id, session))
+
+    restarted_store = ClinicalSessionStore(
+        {},
+        repository=SQLiteClinicalSessionRepository(database_path),
+    )
+    with patch("ddxdriver.clinical.api.create_clinical_session", side_effect=_fake_create):
+        restored = asyncio.run(restarted_store.get(session_id))
+
+    assert restored.marker == "after investigations"
+
+
+def test_failed_initial_persist_does_not_leave_non_durable_hot_session(tmp_path):
+    repository = SQLiteClinicalSessionRepository(tmp_path / "clinical.sqlite3")
+    store = ClinicalSessionStore({}, repository=repository)
+
+    with (
+        patch("ddxdriver.clinical.api.create_clinical_session", side_effect=_fake_create),
+        patch.object(repository, "save", side_effect=RuntimeError("disk unavailable")),
+        pytest.raises(RuntimeError, match="disk unavailable"),
+    ):
+        asyncio.run(store.create("Chief complaint: Headache", patient_id="CASE-5"))
+
+    assert store.sessions == {}
+    assert store.locks == {}
