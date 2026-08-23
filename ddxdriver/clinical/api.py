@@ -115,6 +115,32 @@ class ClinicalSessionStore:
         self.session_expires_at.pop(session_id, None)
         self.locks.pop(session_id, None)
 
+    async def _validate_persisted_lifecycle(
+        self,
+        session_id: str,
+        owner_subject: str,
+    ) -> None:
+        """Keep persisted expiry/archive state authoritative for hot-cache sessions.
+
+        TTL is disabled by default. When enabled, a cheap repository read prevents
+        a session restored after a process restart from receiving an accidental
+        fresh in-memory TTL before the next successful mutation.
+        """
+        if self.lifecycle_config.ttl_hours == 0:
+            return
+        try:
+            state = await asyncio.to_thread(
+                self.repository.load,
+                session_id,
+                owner_subject=owner_subject,
+            )
+        except (SessionExpiredError, SessionArchivedError):
+            self._drop_cache(session_id)
+            raise
+        if state is None:
+            self._drop_cache(session_id)
+            raise KeyError(session_id)
+
     async def create(
         self,
         patient_initial_info: str,
@@ -149,6 +175,7 @@ class ClinicalSessionStore:
         if session is not None:
             if self.session_owners.get(session_id) != owner_subject:
                 raise KeyError(session_id)
+            await self._validate_persisted_lifecycle(session_id, owner_subject)
             if self._cache_expired(session_id):
                 self._drop_cache(session_id)
                 await asyncio.to_thread(
@@ -164,6 +191,7 @@ class ClinicalSessionStore:
             if session is not None:
                 if self.session_owners.get(session_id) != owner_subject:
                     raise KeyError(session_id)
+                await self._validate_persisted_lifecycle(session_id, owner_subject)
                 return session
 
             state = await asyncio.to_thread(
@@ -195,7 +223,9 @@ class ClinicalSessionStore:
 
             self.sessions[session_id] = session
             self.session_owners[session_id] = owner_subject
-            self.session_expires_at[session_id] = self.lifecycle_config.expires_at()
+            # The persisted repository remains authoritative until a mutation
+            # refreshes the TTL via persist(). Do not manufacture a fresh cache TTL here.
+            self.session_expires_at[session_id] = None
             self.locks.setdefault(session_id, asyncio.Lock())
             return session
 
