@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .monitoring import configure_monitoring, dispatch_monitoring_event
+
 
 LOGGER_NAME = "meddxagent.clinical"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -33,12 +35,7 @@ def _utc_timestamp() -> str:
 
 
 def configure_observability() -> logging.Logger:
-    """Configure one-line JSON logs suitable for container log collection.
-
-    Logs intentionally contain operational metadata only. Clinical request bodies,
-    patient text, generated questions, answers and diagnostic content are never
-    added by this module.
-    """
+    """Configure privacy-filtered JSON logs and the optional monitoring sink."""
     logger = logging.getLogger(LOGGER_NAME)
     level_name = os.getenv("MEDDX_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -60,6 +57,8 @@ def configure_observability() -> logging.Logger:
             file_handler._meddx_structured = True
             logger.addHandler(file_handler)
 
+    # Validate monitoring configuration during startup rather than at first error.
+    configure_monitoring()
     return logger
 
 
@@ -69,11 +68,24 @@ def request_id_from_header(value: str | None) -> str:
     return str(uuid.uuid4())
 
 
+def _stable_reference(value: str | None, length: int = 16) -> str | None:
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
 def session_reference(session_id: str | None) -> str | None:
     """Return a stable non-reversible short reference for log correlation."""
-    if not session_id:
-        return None
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return _stable_reference(session_id)
+
+
+def actor_reference(subject: str | None) -> str | None:
+    """Pseudonymize an authenticated subject before it reaches logs/monitoring."""
+    return _stable_reference(subject)
+
+
+def resource_reference(resource_id: str | None) -> str | None:
+    return _stable_reference(resource_id)
 
 
 def build_event(event: str, **fields: Any) -> dict[str, Any]:
@@ -93,12 +105,7 @@ def build_error_event(
     error: BaseException,
     **fields: Any,
 ) -> dict[str, Any]:
-    """Build an error event without serializing the exception message.
-
-    Provider/model exceptions can contain request details. Keeping only the type
-    and sanitized stack locations gives operators correlation data without copying
-    clinical content into logs.
-    """
+    """Build an error event without serializing the exception message."""
     frames = traceback.extract_tb(error.__traceback__) if error.__traceback__ else []
     safe_trace = [
         {
@@ -119,3 +126,4 @@ def build_error_event(
 def emit_event(payload: dict[str, Any], level: int = logging.INFO) -> None:
     logger = configure_observability()
     logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str))
+    dispatch_monitoring_event(payload, level)
