@@ -40,7 +40,11 @@ jobs:
             tests/test_clinical_security.py \
             tests/test_clinical_security_contract.py \
             tests/test_clinical_deployment_contract.py \
-            tests/test_clinical_rag.py
+            tests/test_clinical_rag.py \
+            tests/test_clinical_auth.py \
+            tests/test_clinical_platform.py \
+            tests/test_clinical_monitoring.py \
+            tests/test_clinical_e2e.py
 
       - name: Validate Railway deployment config
         run: |
@@ -68,6 +72,9 @@ jobs:
           with zipfile.ZipFile(wheels[0]) as archive:
               names = set(archive.namelist())
               assert "ddxdriver/clinical/api.py" in names
+              assert "ddxdriver/clinical/auth.py" in names
+              assert "ddxdriver/clinical/lifecycle.py" in names
+              assert "ddxdriver/clinical/monitoring.py" in names
               assert "ddxdriver/clinical/observability.py" in names
               assert "ddxdriver/clinical/persistence.py" in names
               assert "ddxdriver/clinical/security.py" in names
