@@ -4,36 +4,61 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tornado.httpserver
 import tornado.ioloop
 import tornado.web
 
+from .auth import (
+    AuthConfig,
+    AuthIdentity,
+    AuthenticationError,
+    AuthorizationError,
+    AuthProvider,
+    authorize,
+    build_auth_provider,
+)
 from .config import create_clinical_session, load_clinical_config
+from .lifecycle import SessionLifecycleConfig
 from .observability import (
+    actor_reference,
     build_error_event,
     build_event,
     configure_observability,
     emit_event,
     request_id_from_header,
+    resource_reference,
     session_reference,
 )
-from .persistence import SQLiteClinicalSessionRepository
+from .persistence import (
+    DEFAULT_OWNER_SUBJECT,
+    ClinicalRepository,
+    SessionArchivedError,
+    SessionExpiredError,
+    build_clinical_repository,
+)
 from .security import (
-    CLINICAL_API_PREFIX,
     SESSION_CREATE_PATH,
+    RateLimiter,
     SecurityConfig,
-    SlidingWindowRateLimiter,
+    build_rate_limiter,
     client_rate_subject,
     has_json_content_type,
+    identity_rate_subject,
     is_model_action,
+    is_protected_api_path,
     origin_is_allowed,
     session_id_from_path,
     session_rate_subject,
+    validate_case_id,
     validate_patient_id,
     validate_required_text,
 )
+
+
+CASE_STATUSES = frozenset({"draft", "ready", "active", "completed", "error"})
 
 
 def missing_runtime_environment(config: dict) -> list[str]:
@@ -55,21 +80,48 @@ def missing_runtime_environment(config: dict) -> list[str]:
 
 
 class ClinicalSessionStore:
-    """Resumable clinical session storage with an in-process hot cache.
+    """Resumable owner-scoped clinical sessions with a process-local hot cache."""
 
-    Session state is serialized to SQLite after each successful mutation. Runtime
-    model/agent objects remain in memory while the process is alive and are rebuilt
-    from persisted state when a session is requested after a process restart.
-    """
-
-    def __init__(self, config: dict, repository: SQLiteClinicalSessionRepository | None = None):
+    def __init__(
+        self,
+        config: dict,
+        repository: ClinicalRepository | None = None,
+        lifecycle_config: SessionLifecycleConfig | None = None,
+    ):
         self.config = config
-        self.repository = repository or SQLiteClinicalSessionRepository()
+        self.repository = repository or build_clinical_repository()
+        self.lifecycle_config = lifecycle_config or SessionLifecycleConfig.from_env()
         self.sessions: dict[str, object] = {}
+        self.session_owners: dict[str, str] = {}
+        self.session_expires_at: dict[str, datetime | None] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self._load_lock = asyncio.Lock()
+        self._last_cleanup = 0.0
 
-    async def create(self, patient_initial_info: str, patient_id=None) -> tuple[str, object]:
+    async def _maybe_cleanup(self) -> None:
+        now = time.monotonic()
+        if now - self._last_cleanup < self.lifecycle_config.cleanup_interval_seconds:
+            return
+        self._last_cleanup = now
+        await asyncio.to_thread(self.repository.cleanup_expired)
+
+    def _cache_expired(self, session_id: str) -> bool:
+        expires_at = self.session_expires_at.get(session_id)
+        return expires_at is not None and expires_at <= datetime.now(timezone.utc)
+
+    def _drop_cache(self, session_id: str) -> None:
+        self.sessions.pop(session_id, None)
+        self.session_owners.pop(session_id, None)
+        self.session_expires_at.pop(session_id, None)
+        self.locks.pop(session_id, None)
+
+    async def create(
+        self,
+        patient_initial_info: str,
+        patient_id=None,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ) -> tuple[str, object]:
+        await self._maybe_cleanup()
         session_id = str(uuid.uuid4())
         session = await asyncio.to_thread(
             create_clinical_session,
@@ -78,26 +130,47 @@ class ClinicalSessionStore:
             self.config,
         )
         self.sessions[session_id] = session
+        self.session_owners[session_id] = owner_subject
         self.locks[session_id] = asyncio.Lock()
         try:
-            await self.persist(session_id, session)
+            await self.persist(session_id, session, owner_subject=owner_subject)
         except Exception:
-            self.sessions.pop(session_id, None)
-            self.locks.pop(session_id, None)
+            self._drop_cache(session_id)
             raise
         return session_id, session
 
-    async def get(self, session_id: str):
+    async def get(
+        self,
+        session_id: str,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ):
+        await self._maybe_cleanup()
         session = self.sessions.get(session_id)
         if session is not None:
+            if self.session_owners.get(session_id) != owner_subject:
+                raise KeyError(session_id)
+            if self._cache_expired(session_id):
+                self._drop_cache(session_id)
+                await asyncio.to_thread(
+                    self.repository.delete,
+                    session_id,
+                    owner_subject=owner_subject,
+                )
+                raise SessionExpiredError(session_id)
             return session
 
         async with self._load_lock:
             session = self.sessions.get(session_id)
             if session is not None:
+                if self.session_owners.get(session_id) != owner_subject:
+                    raise KeyError(session_id)
                 return session
 
-            state = await asyncio.to_thread(self.repository.load, session_id)
+            state = await asyncio.to_thread(
+                self.repository.load,
+                session_id,
+                owner_subject=owner_subject,
+            )
             if state is None:
                 raise KeyError(session_id)
 
@@ -121,20 +194,67 @@ class ClinicalSessionStore:
             await asyncio.to_thread(restore, state)
 
             self.sessions[session_id] = session
+            self.session_owners[session_id] = owner_subject
+            self.session_expires_at[session_id] = self.lifecycle_config.expires_at()
             self.locks.setdefault(session_id, asyncio.Lock())
             return session
 
-    def lock(self, session_id: str) -> asyncio.Lock:
-        if session_id not in self.sessions:
+    def lock(
+        self,
+        session_id: str,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ) -> asyncio.Lock:
+        if session_id not in self.sessions or self.session_owners.get(session_id) != owner_subject:
             raise KeyError(session_id)
         return self.locks.setdefault(session_id, asyncio.Lock())
 
-    async def persist(self, session_id: str, session) -> None:
+    async def persist(
+        self,
+        session_id: str,
+        session,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ) -> None:
         serialize = getattr(session, "persistence_state", None)
         if not callable(serialize):
             return
         state = await asyncio.to_thread(serialize)
-        await asyncio.to_thread(self.repository.save, session_id, state)
+        expires_at = self.lifecycle_config.expires_at()
+        await asyncio.to_thread(
+            self.repository.save,
+            session_id,
+            state,
+            owner_subject=owner_subject,
+            expires_at=expires_at,
+        )
+        self.session_expires_at[session_id] = expires_at
+
+    async def archive(
+        self,
+        session_id: str,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ) -> bool:
+        archived = await asyncio.to_thread(
+            self.repository.archive,
+            session_id,
+            owner_subject=owner_subject,
+        )
+        if archived:
+            self._drop_cache(session_id)
+        return archived
+
+    async def delete(
+        self,
+        session_id: str,
+        owner_subject: str = DEFAULT_OWNER_SUBJECT,
+    ) -> bool:
+        deleted = await asyncio.to_thread(
+            self.repository.delete,
+            session_id,
+            owner_subject=owner_subject,
+        )
+        if deleted:
+            self._drop_cache(session_id)
+        return deleted
 
 
 class BaseHandler(tornado.web.RequestHandler):
@@ -142,6 +262,7 @@ class BaseHandler(tornado.web.RequestHandler):
         self.store = store
         self.request_id = request_id_from_header(self.request.headers.get("X-Request-ID"))
         self._request_started = time.monotonic()
+        self.identity: AuthIdentity | None = None
         self.set_header("X-Request-ID", self.request_id)
 
     @property
@@ -149,8 +270,20 @@ class BaseHandler(tornado.web.RequestHandler):
         return self.application.settings["meddx_security_config"]
 
     @property
-    def rate_limiter(self) -> SlidingWindowRateLimiter:
+    def rate_limiter(self) -> RateLimiter:
         return self.application.settings["meddx_rate_limiter"]
+
+    @property
+    def auth_provider(self) -> AuthProvider:
+        return self.application.settings["meddx_auth_provider"]
+
+    @property
+    def auth_config(self) -> AuthConfig:
+        return self.application.settings["meddx_auth_config"]
+
+    @property
+    def owner_subject(self) -> str:
+        return self.identity.subject if self.identity is not None else DEFAULT_OWNER_SUBJECT
 
     def set_default_headers(self):
         security_config = self.application.settings.get("meddx_security_config")
@@ -164,8 +297,11 @@ class BaseHandler(tornado.web.RequestHandler):
             self.set_header("Access-Control-Allow-Origin", origin)
             self.set_header("Vary", "Origin")
 
-        self.set_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
-        self.set_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.set_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Request-ID",
+        )
+        self.set_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
         self.set_header(
             "Access-Control-Expose-Headers",
             "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining",
@@ -195,22 +331,44 @@ class BaseHandler(tornado.web.RequestHandler):
             self.write_api_error(413, "Request body is too large")
             return
 
-        if self.request.method == "OPTIONS" or not self.request.path.startswith(
-            CLINICAL_API_PREFIX
-        ):
+        if self.request.method == "OPTIONS":
             return
 
-        general_decision = self.rate_limiter.check(
-            client_rate_subject(self.request.remote_ip),
-            self.security_config.requests_per_minute,
-        )
-        if not general_decision.allowed:
-            await self.reject_rate_limit("client", general_decision.retry_after_seconds)
-            return
+        if is_protected_api_path(self.request.path):
+            try:
+                self.identity = self.auth_provider.authenticate(self.request.headers)
+                authorize(self.identity, self.auth_config.required_roles)
+            except AuthenticationError:
+                await self.audit_event("auth.authenticate", "rejected")
+                self.set_header("WWW-Authenticate", 'Bearer realm="MEDDxAgent"')
+                self.write_api_error(401, "Authentication required")
+                return
+            except AuthorizationError:
+                await self.audit_event("auth.authorize", "rejected")
+                self.write_api_error(403, "Not authorized for this resource")
+                return
+
+            general_subject = (
+                identity_rate_subject(self.identity.subject)
+                if self.identity.authenticated
+                else client_rate_subject(self.request.remote_ip)
+            )
+            general_decision = self.rate_limiter.check(
+                general_subject,
+                self.security_config.requests_per_minute,
+            )
+            if not general_decision.allowed:
+                await self.reject_rate_limit("request", general_decision.retry_after_seconds)
+                return
 
         if self.request.method == "POST" and self.request.path == SESSION_CREATE_PATH:
+            create_subject = (
+                identity_rate_subject(self.owner_subject) + ":session-create"
+                if self.identity and self.identity.authenticated
+                else client_rate_subject(self.request.remote_ip) + ":session-create"
+            )
             create_decision = self.rate_limiter.check(
-                client_rate_subject(self.request.remote_ip) + ":session-create",
+                create_subject,
                 self.security_config.session_creates_per_minute,
             )
             if not create_decision.allowed:
@@ -266,6 +424,7 @@ class BaseHandler(tornado.web.RequestHandler):
             build_event(
                 "http.request",
                 request_id=self.request_id,
+                actor_ref=actor_reference(self.identity.subject) if self.identity else None,
                 handler=type(self).__name__,
                 method=self.request.method,
                 status=self.get_status(),
@@ -296,12 +455,21 @@ class BaseHandler(tornado.web.RequestHandler):
         self.set_status(status)
         self.finish({"error": message})
 
+    async def require_authenticated_identity(self) -> bool:
+        if self.identity is not None and self.identity.authenticated:
+            return True
+        await self.audit_event("auth.required", "rejected")
+        self.set_header("WWW-Authenticate", 'Bearer realm="MEDDxAgent"')
+        self.write_api_error(401, "Authenticated account required")
+        return False
+
     def monitor_error(self, operation: str, error: BaseException, session_id: str | None = None):
         emit_event(
             build_error_event(
                 "clinical.error",
                 error,
                 request_id=self.request_id,
+                actor_ref=actor_reference(self.identity.subject) if self.identity else None,
                 operation=operation,
                 session_ref=session_reference(session_id),
             ),
@@ -326,6 +494,7 @@ class BaseHandler(tornado.web.RequestHandler):
             build_event(
                 "clinical.audit",
                 request_id=self.request_id,
+                actor_ref=actor_reference(self.identity.subject) if self.identity else None,
                 action=action,
                 outcome=outcome,
                 session_ref=session_reference(session_id),
@@ -347,8 +516,16 @@ class BaseHandler(tornado.web.RequestHandler):
             return None
 
         try:
-            session = await self.store.get(session_id)
-            lock = self.store.lock(session_id)
+            session = await self.store.get(session_id, owner_subject=self.owner_subject)
+            lock = self.store.lock(session_id, owner_subject=self.owner_subject)
+        except SessionExpiredError:
+            await self.audit_event(audit_action, "expired", session_id)
+            self.write_api_error(410, "Clinical session expired")
+            return None
+        except SessionArchivedError:
+            await self.audit_event(audit_action, "archived", session_id)
+            self.write_api_error(410, "Clinical session archived")
+            return None
         except KeyError:
             await self.audit_event(audit_action, "not_found", session_id)
             self.write_api_error(404, "Clinical session not found")
@@ -368,7 +545,11 @@ class BaseHandler(tornado.web.RequestHandler):
             async with lock:
                 result = await asyncio.to_thread(action, session)
                 if persist:
-                    await self.store.persist(session_id, session)
+                    await self.store.persist(
+                        session_id,
+                        session,
+                        owner_subject=self.owner_subject,
+                    )
                 await self.audit_event(audit_action, "success", session_id)
                 return result
         except (ValueError, RuntimeError, TypeError) as exc:
@@ -432,7 +613,11 @@ class SessionsHandler(BaseHandler):
                 payload.get("patient_id"),
                 self.security_config.max_patient_id_chars,
             )
-            session_id, session = await self.store.create(patient_initial_info, patient_id)
+            session_id, session = await self.store.create(
+                patient_initial_info,
+                patient_id,
+                owner_subject=self.owner_subject,
+            )
         except (ValueError, TypeError) as exc:
             await self.audit_event(
                 "session.create",
@@ -466,6 +651,27 @@ class SessionHandler(BaseHandler):
         )
         if result is not None:
             self.finish({"session_id": session_id, **result})
+
+    async def delete(self, session_id: str):
+        deleted = await self.store.delete(session_id, owner_subject=self.owner_subject)
+        if not deleted:
+            await self.audit_event("session.delete", "not_found", session_id)
+            self.write_api_error(404, "Clinical session not found")
+            return
+        await self.audit_event("session.delete", "success", session_id)
+        self.set_status(204)
+        self.finish()
+
+
+class SessionArchiveHandler(BaseHandler):
+    async def post(self, session_id: str):
+        archived = await self.store.archive(session_id, owner_subject=self.owner_subject)
+        if not archived:
+            await self.audit_event("session.archive", "not_found", session_id)
+            self.write_api_error(404, "Clinical session not found")
+            return
+        await self.audit_event("session.archive", "success", session_id)
+        self.finish({"status": "archived"})
 
 
 class ContextHandler(BaseHandler):
@@ -578,29 +784,193 @@ class RunHandler(BaseHandler):
             self.finish({"session_id": session_id, **result})
 
 
+def _validated_case_payload(payload: dict, path_case_id: str, max_case_id_chars: int) -> dict:
+    case_id = validate_case_id(payload.get("id"), max_case_id_chars)
+    if case_id != path_case_id:
+        raise ValueError("Case payload id must match the request path")
+    status = payload.get("status")
+    if status not in CASE_STATUSES:
+        raise ValueError("Case payload has an invalid status")
+    patient = payload.get("patient")
+    workflow = payload.get("workflow")
+    if not isinstance(patient, dict) or not isinstance(workflow, dict):
+        raise ValueError("Case payload must include patient and workflow objects")
+    return payload
+
+
+class CasesHandler(BaseHandler):
+    async def get(self):
+        if not await self.require_authenticated_identity():
+            return
+        try:
+            limit = int(self.get_query_argument("limit", "100"))
+            cases = await asyncio.to_thread(
+                self.store.repository.list_cases,
+                self.owner_subject,
+                limit=limit,
+            )
+        except ValueError as exc:
+            self.write_api_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.monitor_error("case.list", exc)
+            self.write_api_error(500, "Unable to load cases")
+            return
+        await self.audit_event("case.list", "success", count=len(cases))
+        self.finish({"cases": cases})
+
+
+class CaseHandler(BaseHandler):
+    async def get(self, case_id: str):
+        if not await self.require_authenticated_identity():
+            return
+        try:
+            case_id = validate_case_id(case_id, self.security_config.max_case_id_chars)
+            case = await asyncio.to_thread(
+                self.store.repository.load_case,
+                self.owner_subject,
+                case_id,
+            )
+        except ValueError as exc:
+            self.write_api_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.monitor_error("case.read", exc)
+            self.write_api_error(500, "Unable to load case")
+            return
+        if case is None:
+            await self.audit_event("case.read", "not_found", case_ref=resource_reference(case_id))
+            self.write_api_error(404, "Case not found")
+            return
+        await self.audit_event("case.read", "success", case_ref=resource_reference(case_id))
+        self.finish({"case": case})
+
+    async def put(self, case_id: str):
+        if not await self.require_authenticated_identity():
+            return
+        try:
+            case_id = validate_case_id(case_id, self.security_config.max_case_id_chars)
+            payload = _validated_case_payload(
+                self.json_body(),
+                case_id,
+                self.security_config.max_case_id_chars,
+            )
+            case = await asyncio.to_thread(
+                self.store.repository.save_case,
+                self.owner_subject,
+                case_id,
+                payload,
+            )
+        except (ValueError, TypeError) as exc:
+            await self.audit_event(
+                "case.save",
+                "rejected",
+                case_ref=resource_reference(case_id),
+                error_type=type(exc).__name__,
+            )
+            self.write_api_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.monitor_error("case.save", exc)
+            self.write_api_error(500, "Unable to save case")
+            return
+        await self.audit_event("case.save", "success", case_ref=resource_reference(case_id))
+        self.finish({"case": case})
+
+    async def delete(self, case_id: str):
+        if not await self.require_authenticated_identity():
+            return
+        try:
+            case_id = validate_case_id(case_id, self.security_config.max_case_id_chars)
+            deleted = await asyncio.to_thread(
+                self.store.repository.delete_case,
+                self.owner_subject,
+                case_id,
+            )
+        except ValueError as exc:
+            self.write_api_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.monitor_error("case.delete", exc)
+            self.write_api_error(500, "Unable to delete case")
+            return
+        if not deleted:
+            self.write_api_error(404, "Case not found")
+            return
+        await self.audit_event("case.delete", "success", case_ref=resource_reference(case_id))
+        self.set_status(204)
+        self.finish()
+
+
+class CaseArchiveHandler(BaseHandler):
+    async def post(self, case_id: str):
+        if not await self.require_authenticated_identity():
+            return
+        try:
+            case_id = validate_case_id(case_id, self.security_config.max_case_id_chars)
+            archived = await asyncio.to_thread(
+                self.store.repository.archive_case,
+                self.owner_subject,
+                case_id,
+            )
+        except ValueError as exc:
+            self.write_api_error(400, str(exc))
+            return
+        except Exception as exc:
+            self.monitor_error("case.archive", exc)
+            self.write_api_error(500, "Unable to archive case")
+            return
+        if not archived:
+            self.write_api_error(404, "Case not found")
+            return
+        await self.audit_event("case.archive", "success", case_ref=resource_reference(case_id))
+        self.finish({"status": "archived"})
+
+
 def make_app(
     config_path: str | Path | None = None,
-    session_repository: SQLiteClinicalSessionRepository | None = None,
+    session_repository: ClinicalRepository | None = None,
     security_config: SecurityConfig | None = None,
-    rate_limiter: SlidingWindowRateLimiter | None = None,
+    rate_limiter: RateLimiter | None = None,
+    auth_config: AuthConfig | None = None,
+    auth_provider: AuthProvider | None = None,
+    lifecycle_config: SessionLifecycleConfig | None = None,
 ) -> tornado.web.Application:
     configure_observability()
     config = load_clinical_config(config_path)
     security_config = security_config or SecurityConfig.from_env()
-    rate_limiter = rate_limiter or SlidingWindowRateLimiter(
-        max_keys=security_config.max_rate_limit_keys
+    repository = session_repository or build_clinical_repository()
+    auth_config = auth_config or (auth_provider.config if auth_provider else AuthConfig.from_env())
+    auth_provider = auth_provider or build_auth_provider(auth_config)
+    rate_limiter = rate_limiter or build_rate_limiter(repository, security_config)
+    lifecycle_config = lifecycle_config or SessionLifecycleConfig.from_env()
+    store = ClinicalSessionStore(
+        config,
+        repository=repository,
+        lifecycle_config=lifecycle_config,
     )
-    store = ClinicalSessionStore(config, repository=session_repository)
     routes = [
         (r"/api/v1/health", HealthHandler, {"store": store}),
         (r"/api/v1/ready", ReadinessHandler, {"store": store}),
         (r"/api/v1/clinical/sessions", SessionsHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)", SessionHandler, {"store": store}),
+        (
+            r"/api/v1/clinical/sessions/([^/]+)/archive",
+            SessionArchiveHandler,
+            {"store": store},
+        ),
         (r"/api/v1/clinical/sessions/([^/]+)/context", ContextHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/question", NextQuestionHandler, {"store": store}),
         (r"/api/v1/clinical/sessions/([^/]+)/answer", AnswerHandler, {"store": store}),
-        (r"/api/v1/clinical/sessions/([^/]+)/history/finish", FinishHistoryHandler, {"store": store}),
+        (
+            r"/api/v1/clinical/sessions/([^/]+)/history/finish",
+            FinishHistoryHandler,
+            {"store": store},
+        ),
         (r"/api/v1/clinical/sessions/([^/]+)/run", RunHandler, {"store": store}),
+        (r"/api/v1/cases", CasesHandler, {"store": store}),
+        (r"/api/v1/cases/([^/]+)", CaseHandler, {"store": store}),
+        (r"/api/v1/cases/([^/]+)/archive", CaseArchiveHandler, {"store": store}),
     ]
     return tornado.web.Application(
         routes,
@@ -609,6 +979,8 @@ def make_app(
         serve_traceback=False,
         meddx_security_config=security_config,
         meddx_rate_limiter=rate_limiter,
+        meddx_auth_config=auth_config,
+        meddx_auth_provider=auth_provider,
     )
 
 
@@ -617,7 +989,14 @@ def main():
     config_path = os.getenv("MEDDX_CLINICAL_CONFIG")
     port = int(os.getenv("PORT", "8000"))
     security_config = SecurityConfig.from_env()
-    app = make_app(config_path, security_config=security_config)
+    auth_config = AuthConfig.from_env()
+    lifecycle_config = SessionLifecycleConfig.from_env()
+    app = make_app(
+        config_path,
+        security_config=security_config,
+        auth_config=auth_config,
+        lifecycle_config=lifecycle_config,
+    )
     server = tornado.httpserver.HTTPServer(
         app,
         xheaders=False,
@@ -632,7 +1011,8 @@ def main():
         build_event(
             "service.started",
             port=port,
-            rate_limiting=True,
+            auth_mode=auth_config.mode,
+            rate_limit_backend=security_config.rate_limit_backend,
             max_body_bytes=security_config.max_body_bytes,
         )
     )
