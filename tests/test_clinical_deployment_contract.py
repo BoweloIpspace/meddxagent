@@ -1,4 +1,3 @@
-import os
 import tomllib
 from pathlib import Path
 
@@ -53,11 +52,16 @@ def test_default_runtime_requires_openai_key_but_not_optional_ncbi_identity(monk
 
 def test_env_example_documents_every_runtime_control_used_by_deployment_code():
     text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    documented = {
-        line.lstrip("# ").split("=", 1)[0]
-        for line in text.splitlines()
-        if "=" in line and not line.lstrip().startswith("# ") is False
-    }
+    documented = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped[1:].strip()
+        if "=" not in stripped:
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name:
+            documented.add(name)
 
     expected = {
         "OAI_KEY",
