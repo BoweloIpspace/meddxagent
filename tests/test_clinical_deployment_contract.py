@@ -114,7 +114,7 @@ def test_railway_config_keeps_health_check_and_platform_managed_port():
     config = tomllib.loads((REPO_ROOT / "railway.toml").read_text(encoding="utf-8"))
 
     assert config["build"]["builder"] == "DOCKERFILE"
-    assert config["deploy"]["healthcheckPath"] == "/api/v1/health"
+    assert config["deploy"]["healthcheckPath"] == "/api/v1/ready"
     assert config["deploy"]["healthcheckTimeout"] == 300
     assert "PORT" not in config.get("deploy", {})
 
