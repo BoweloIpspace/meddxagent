@@ -55,6 +55,7 @@ jobs:
             tests/test_clinical_runtime.py \
             tests/test_clinical_api.py \
             tests/test_clinical_persistence.py \
+            tests/test_clinical_case_pagination.py \
             tests/test_clinical_observability.py \
             tests/test_clinical_security.py \
             tests/test_clinical_security_contract.py \
