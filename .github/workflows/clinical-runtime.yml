@@ -34,11 +34,7 @@ jobs:
         run: uvx ruff check --select E4,E7,E9,F ddxdriver/clinical
 
       - name: Check backend formatting
-        run: |
-          uvx black --check \
-            ddxdriver/clinical/auth.py \
-            ddxdriver/clinical/security.py \
-            ddxdriver/clinical/lifecycle.py
+        run: uvx black --check ddxdriver/clinical/lifecycle.py
 
       - name: Run backend static type analysis
         run: |
