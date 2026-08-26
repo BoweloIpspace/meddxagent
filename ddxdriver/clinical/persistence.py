@@ -96,7 +96,13 @@ class ClinicalRepository(Protocol):
     def load_case(self, owner_subject: str, case_id: str) -> dict | None:
         ...
 
-    def list_cases(self, owner_subject: str, *, limit: int = 100) -> list[dict]:
+    def list_cases(
+        self,
+        owner_subject: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         ...
 
     def archive_case(self, owner_subject: str, case_id: str) -> bool:
@@ -372,18 +378,26 @@ class SQLiteClinicalSessionRepository:
             raise ValueError("Persisted clinical case payload is invalid")
         return payload
 
-    def list_cases(self, owner_subject: str, *, limit: int = 100) -> list[dict]:
+    def list_cases(
+        self,
+        owner_subject: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         if limit < 1 or limit > 500:
             raise ValueError("Case list limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("Case list offset must be zero or greater")
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT payload_json FROM clinical_cases
                 WHERE owner_subject = ? AND archived_at IS NULL
-                ORDER BY updated_at DESC
-                LIMIT ?
+                ORDER BY updated_at DESC, case_id DESC
+                LIMIT ? OFFSET ?
                 """,
-                (owner_subject, limit),
+                (owner_subject, limit, offset),
             ).fetchall()
         payloads = []
         for row in rows:
@@ -669,18 +683,26 @@ class PostgresClinicalRepository:
             raise ValueError("Persisted clinical case payload is invalid")
         return payload
 
-    def list_cases(self, owner_subject: str, *, limit: int = 100) -> list[dict]:
+    def list_cases(
+        self,
+        owner_subject: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         if limit < 1 or limit > 500:
             raise ValueError("Case list limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("Case list offset must be zero or greater")
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT payload_json FROM clinical_cases
                 WHERE owner_subject = %s AND archived_at IS NULL
-                ORDER BY updated_at DESC
-                LIMIT %s
+                ORDER BY updated_at DESC, case_id DESC
+                LIMIT %s OFFSET %s
                 """,
-                (owner_subject, limit),
+                (owner_subject, limit, offset),
             ).fetchall()
         payloads: list[dict] = []
         for row in rows:
