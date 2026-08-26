@@ -834,10 +834,12 @@ class CasesHandler(BaseHandler):
             return
         try:
             limit = int(self.get_query_argument("limit", "100"))
+            offset = int(self.get_query_argument("offset", "0"))
             cases = await asyncio.to_thread(
                 self.store.repository.list_cases,
                 self.owner_subject,
                 limit=limit,
+                offset=offset,
             )
         except ValueError as exc:
             self.write_api_error(400, str(exc))
