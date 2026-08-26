@@ -13,7 +13,7 @@ on:
 jobs:
   clinical-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +29,25 @@ jobs:
           uv venv
           uv pip install -e ".[dev]"
           uv pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Lint backend
+        run: uvx ruff check ddxdriver/clinical tests/test_clinical*.py
+
+      - name: Check backend formatting
+        run: uvx black --check ddxdriver/clinical tests/test_clinical*.py
+
+      - name: Run backend static type analysis
+        run: |
+          uvx mypy \
+            --ignore-missing-imports \
+            --follow-imports=skip \
+            --check-untyped-defs \
+            ddxdriver/clinical/auth.py \
+            ddxdriver/clinical/security.py \
+            ddxdriver/clinical/lifecycle.py
+
+      - name: Audit backend dependencies
+        run: uvx pip-audit --local --skip-editable
 
       - name: Run clinical adapter tests
         run: |
@@ -54,7 +73,7 @@ jobs:
 
           config = tomllib.loads(Path("railway.toml").read_text(encoding="utf-8"))
           assert config["build"]["builder"] == "DOCKERFILE"
-          assert config["deploy"]["healthcheckPath"] == "/api/v1/health"
+          assert config["deploy"]["healthcheckPath"] == "/api/v1/ready"
           assert config["deploy"]["healthcheckTimeout"] == 300
           assert config["deploy"]["restartPolicyType"] == "ON_FAILURE"
           assert config["deploy"]["restartPolicyMaxRetries"] == 10
@@ -87,3 +106,18 @@ jobs:
               content = archive.read(entry_points[0]).decode("utf-8")
               assert "meddx-clinical-api = ddxdriver.clinical.api:main" in content
           PY
+
+      - name: Build and smoke-test production container
+        run: |
+          set -euo pipefail
+          docker build -t meddxagent-ci .
+          container_id=$(docker run -d -p 18000:8000 -e OAI_KEY=ci-placeholder meddxagent-ci)
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18000/api/v1/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs "$container_id"
+          exit 1
