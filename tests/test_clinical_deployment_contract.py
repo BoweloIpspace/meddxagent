@@ -10,73 +10,69 @@ from ddxdriver.clinical.lifecycle import SessionLifecycleConfig
 from ddxdriver.clinical.monitoring import MonitoringConfig
 from ddxdriver.clinical.security import SecurityConfig
 
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_default_production_environment_contract(monkeypatch):
-    for name in (
-        "MEDDX_ALLOWED_ORIGINS",
-        "MEDDX_RATE_LIMIT_REQUESTS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_MODEL_ACTIONS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_SESSION_ACTIONS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_SESSION_CREATES_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_BACKEND",
-        "MEDDX_AUTH_MODE",
-        "MEDDX_SESSION_TTL_HOURS",
-        "MEDDX_SESSION_CLEANUP_INTERVAL_SECONDS",
-        "MEDDX_MONITORING_WEBHOOK_URL",
-        "MEDDX_MONITORING_MIN_LEVEL",
-        "MEDDX_MONITORING_TIMEOUT_SECONDS",
-        "MEDDX_MONITORING_QUEUE_SIZE",
-    ):
-        monkeypatch.delenv(name, raising=False)
+def test_default_clinical_config_matches_production_engine_contract():
+    config = load_clinical_config()
 
-    security = SecurityConfig.from_env()
-    auth = AuthConfig.from_env()
-    lifecycle = SessionLifecycleConfig.from_env()
-    monitoring = MonitoringConfig.from_env()
+    assert config["ddxdriver"]["class_name"] == "ddxdriver.ddxdrivers.open_choice.OpenChoice"
+    assert config["ddxdriver"]["config"]["available_agents"] == [
+        "history_taking",
+        "rag",
+        "diagnosis",
+    ]
+    assert config["ddxdriver"]["config"]["max_turns"] == 5
 
-    assert security.allowed_origins
-    assert security.requests_per_minute > 0
-    assert security.model_actions_per_minute > 0
-    assert security.session_actions_per_minute > 0
-    assert security.session_creates_per_minute > 0
-    assert security.rate_limit_backend == "auto"
-    assert auth.mode == "disabled"
-    assert lifecycle.ttl_hours == 0
-    assert lifecycle.cleanup_interval_seconds > 0
-    assert monitoring.webhook_url is None
+    rag = config["rag"]
+    assert rag["class_name"] == "ddxdriver.rag_agents.searchrag_standard.SearchRAGStandard"
+    assert rag["config"]["corpus_name"] == "PubMed"
+    assert rag["config"]["top_k_search"] == 2
+    assert rag["config"]["max_keyword_searches"] == 3
+    assert rag["config"]["model"]["config"]["model_name"] == "gpt-4o"
 
-
-def test_runtime_readiness_requires_active_model_environment(monkeypatch):
-    monkeypatch.delenv("OAI_KEY", raising=False)
-    monkeypatch.delenv("AZURE_ENDPOINT", raising=False)
-
-    missing = missing_runtime_environment(load_clinical_config())
-
-    assert "OAI_KEY" in missing
-
-
-def test_example_environment_documents_runtime_controls():
-    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    documented = {
-        line.split("=", 1)[0].strip()
-        for line in env_example.splitlines()
-        if line.strip() and not line.lstrip().startswith("#") and "=" in line
+    assert config["history_taking"]["config"]["model"]["config"]["model_name"] == "gpt-4o"
+    assert config["diagnosis"]["config"]["model"]["config"]["model_name"] == "gpt-4o"
+    assert config["diagnosis"]["config"]["fewshot"] == {
+        "type": "none",
+        "num_shots": 0,
+        "self_generated_fewshot_cot": False,
     }
+
+
+def test_default_runtime_requires_openai_key_but_not_optional_ncbi_identity(monkeypatch):
+    config = load_clinical_config()
+    monkeypatch.delenv("OAI_KEY", raising=False)
+    monkeypatch.delenv("NCBI_EMAIL", raising=False)
+    monkeypatch.delenv("NCBI_API_KEY", raising=False)
+
+    assert missing_runtime_environment(config) == ["OAI_KEY"]
+
+    monkeypatch.setenv("OAI_KEY", "test-openai-key")
+    assert missing_runtime_environment(config) == []
+
+
+def test_env_example_documents_every_runtime_control_used_by_deployment_code():
+    text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    documented = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped[1:].strip()
+        if "=" not in stripped:
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name:
+            documented.add(name)
+
     expected = {
         "OAI_KEY",
-        "MEDDX_HOST",
-        "MEDDX_PORT",
-        "MEDDX_CONFIG_PATH",
-        "MEDDX_SESSION_DB_PATH",
-        "MEDDX_DATABASE_URL",
+        "NCBI_EMAIL",
+        "NCBI_API_KEY",
         "MEDDX_ALLOWED_ORIGINS",
-        "MEDDX_RATE_LIMIT_REQUESTS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_MODEL_ACTIONS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_SESSION_ACTIONS_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_SESSION_CREATES_PER_MINUTE",
-        "MEDDX_RATE_LIMIT_BACKEND",
+        "MEDDX_DATABASE_URL",
+        "MEDDX_SESSION_DB_PATH",
         "MEDDX_AUTH_MODE",
         "MEDDX_AUTH_REQUIRED_ROLES",
         "MEDDX_AUTH_SHARED_TOKEN",
@@ -92,9 +88,23 @@ def test_example_environment_documents_runtime_controls():
         "MEDDX_LOG_LEVEL",
         "MEDDX_AUDIT_LOG_PATH",
         "MEDDX_MONITORING_WEBHOOK_URL",
-        "MEDDX_MONITORING_MIN_LEVEL",
         "MEDDX_MONITORING_TIMEOUT_SECONDS",
-        "MEDDX_MONITORING_QUEUE_SIZE",
+        "MEDDX_MONITORING_MIN_LEVEL",
+        "MEDDX_RATE_LIMIT_BACKEND",
+        "MEDDX_RATE_LIMIT_REQUESTS_PER_MINUTE",
+        "MEDDX_RATE_LIMIT_SESSION_CREATES_PER_MINUTE",
+        "MEDDX_RATE_LIMIT_MODEL_ACTIONS_PER_MINUTE",
+        "MEDDX_RATE_LIMIT_MAX_KEYS",
+        "MEDDX_MAX_BODY_BYTES",
+        "MEDDX_MAX_HEADER_BYTES",
+        "MEDDX_MAX_PATIENT_INFO_CHARS",
+        "MEDDX_MAX_ANSWER_CHARS",
+        "MEDDX_MAX_PATIENT_ID_CHARS",
+        "MEDDX_MAX_CASE_ID_CHARS",
+        "MEDDX_BODY_TIMEOUT_SECONDS",
+        "MEDDX_IDLE_CONNECTION_TIMEOUT_SECONDS",
+        "PORT",
+        "MEDDX_CLINICAL_CONFIG",
     }
 
     assert expected <= documented
@@ -113,3 +123,19 @@ def test_invalid_platform_environment_fails_fast(monkeypatch):
     monkeypatch.setenv("MEDDX_RATE_LIMIT_REQUESTS_PER_MINUTE", "not-a-number")
     with pytest.raises(ValueError, match="must be an integer"):
         SecurityConfig.from_env()
+
+    monkeypatch.setenv("MEDDX_RATE_LIMIT_REQUESTS_PER_MINUTE", "-1")
+    with pytest.raises(ValueError, match="must be between"):
+        SecurityConfig.from_env()
+
+    monkeypatch.setenv("MEDDX_SESSION_TTL_HOURS", "-1")
+    with pytest.raises(ValueError, match="must be between"):
+        SessionLifecycleConfig.from_env()
+
+    monkeypatch.setenv("MEDDX_AUTH_MODE", "unknown")
+    with pytest.raises(ValueError, match="MEDDX_AUTH_MODE"):
+        AuthConfig.from_env()
+
+    monkeypatch.setenv("MEDDX_MONITORING_WEBHOOK_URL", "http://insecure.example/hook")
+    with pytest.raises(ValueError, match="HTTPS"):
+        MonitoringConfig.from_env()
